@@ -69,13 +69,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 cancellationToken);
             response.EnsureSuccessStatusCode();
 
-            using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var stream = await response.Content.ReadAsStreamAsync();
             using var reader = new StreamReader(stream, Encoding.UTF8);
 
             while (!reader.EndOfStream)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var line = await reader.ReadLineAsync(cancellationToken);
+                var line = await reader.ReadLineAsync();
 
                 if (string.IsNullOrEmpty(line) || !line.StartsWith("data: "))
                     continue;

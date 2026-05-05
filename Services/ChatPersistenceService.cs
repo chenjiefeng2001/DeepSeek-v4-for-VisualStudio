@@ -1,8 +1,9 @@
-using DeepSeek_v4_for_VisualStudio.Models;
+﻿using DeepSeek_v4_for_VisualStudio.Models;
 using DeepSeek_v4_for_VisualStudio.Utils;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -38,9 +39,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             if (string.IsNullOrWhiteSpace(solutionPath))
                 return Path.Combine(BaseDir, "_unsaved.json");
 
-            var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(solutionPath));
-            var hash = Convert.ToHexString(hashBytes)[..16];
-            return Path.Combine(BaseDir, $"proj_{hash}.json");
+            using (var sha256 = SHA256.Create())
+            {
+                var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(solutionPath));
+                var hash = BitConverter.ToString(hashBytes).Replace("-", "").Substring(0, 16);
+                return Path.Combine(BaseDir, $"proj_{hash}.json");
+            }
         }
 
         /// <summary>
@@ -62,7 +66,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 };
 
                 var json = JsonSerializer.Serialize(dto, JsonOptions);
-                await File.WriteAllTextAsync(filePath, json, Encoding.UTF8);
+                using (var writer = new StreamWriter(filePath, false, Encoding.UTF8))
+                {
+                    await writer.WriteAsync(json);
+                }
                 Logger.Info($"对话已保存 ({messages.Count} 条消息) → {Path.GetFileName(filePath)}");
             }
             catch (Exception ex)

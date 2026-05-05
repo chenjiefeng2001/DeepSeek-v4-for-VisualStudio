@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
@@ -127,8 +128,11 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         private string _role = "user";
         private string _content = string.Empty;
         private string _reasoningContent = string.Empty;
+        private string _htmlContent = string.Empty;
+        private string _htmlDataUri = string.Empty;
         private DateTime _timestamp = DateTime.Now;
         private bool _isStreaming;
+        private bool _isRendered;
 
         [DataMember]
         public string Role
@@ -155,6 +159,29 @@ namespace DeepSeek_v4_for_VisualStudio.Models
             set => SetProperty(ref _reasoningContent, value);
         }
 
+        /// <summary>
+        /// Markdown 渲染后的 HTML 内容（带深色主题 CSS）。
+        /// 由 MarkdownRenderService 在流式完成后生成。
+        /// 为空时表示尚未渲染或正在流式传输中。
+        /// 注意：此属性较大（~60KB），不通过 RPC 同步到 UI，仅用于本地持久化。
+        /// </summary>
+        public string HtmlContent
+        {
+            get => _htmlContent;
+            set => SetProperty(ref _htmlContent, value);
+        }
+
+        /// <summary>
+        /// data:text/html;base64,... 格式的 Data URI，可直接绑定到 WebView2.Source。
+        /// 由 MarkdownRenderService.ConvertToDataUri() 生成。
+        /// 注意：此属性较大（~60KB），不通过 RPC 同步到 UI，仅用于本地持久化。
+        /// </summary>
+        public string HtmlDataUri
+        {
+            get => _htmlDataUri;
+            set => SetProperty(ref _htmlDataUri, value);
+        }
+
         [DataMember]
         public DateTime Timestamp
         {
@@ -167,6 +194,17 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         {
             get => _isStreaming;
             set => SetProperty(ref _isStreaming, value);
+        }
+
+        /// <summary>
+        /// 指示 Markdown 是否已完成 HTML 渲染。
+        /// 用于 XAML 触发器切换 TextBox → WebView2 显示。
+        /// </summary>
+        [DataMember]
+        public bool IsRendered
+        {
+            get => _isRendered;
+            set => SetProperty(ref _isRendered, value);
         }
 
         // INotifyPropertyChanged 实现
