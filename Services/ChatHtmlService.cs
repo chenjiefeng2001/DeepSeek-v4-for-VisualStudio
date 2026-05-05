@@ -8,9 +8,10 @@ using System.Text.RegularExpressions;
 namespace DeepSeek_v4_for_VisualStudio.Services
 {
     /// <summary>
-    /// 将聊天消息列表构建为完整的 HTML 页面，用于 WebView2 (Chromium) 渲染。
-    /// 含内嵌 JS 语法高亮、代码复制按钮、Shift+滚轮横向滚动、流式自动滚动。
-    /// 参考 VisualChatGPTStudioShared ucChat 的 UpdateBrowser 模板。
+    /// 将聊天消息列表构建为 HTML 页面，用于 WebView2 (Chromium) 渲染。
+    /// 支持增量渲染：初始全页 NavigateToString + 后续 ExecuteScriptAsync 增量追加，
+    /// 消除流式输出时的全页刷新闪烁。
+    /// 对标 VisualChatGPTStudioShared ucChat 的 UpdateBrowser / AddMessagesHtml 模式。
     /// </summary>
     public static class ChatHtmlService
     {
@@ -18,17 +19,19 @@ namespace DeepSeek_v4_for_VisualStudio.Services
 
         /// <summary>
         /// Markdig 解析管道：启用高级扩展，禁用原生 HTML（防 XSS）。
-        /// 对标 ucChat 中 markdownPipeline 的定义。
         /// </summary>
         private static readonly MarkdownPipeline MarkdownPipeline = new MarkdownPipelineBuilder()
             .UseAdvancedExtensions()
             .DisableHtml()
             .Build();
 
-        private const string AiAvatarHtml = "<span class='avatar avatar-ai'>AI</span>";
-        private const string UserAvatarHtml = "<span class='avatar avatar-user'>U</span>";
+        /// <summary>highlight.js CDN - 语法高亮脚本（与 VisualChatGPTStudioShared 保持一致）</summary>
+        private const string HighlightJsCdnScript = "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js";
 
-        // ═══ 页面 CSS（暗色主题，无边框气泡，代码块纯 CSS） ═══
+        /// <summary>highlight.js CDN - 暗色主题 CSS</summary>
+        private const string HighlightJsCdnStyleDark = "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css";
+
+        // ═══ 页面 CSS（暗色主题，与 Turbo 一致的现代风格） ═══
         private const string PageCss = @"
 *{box-sizing:border-box;margin:0;padding:0}
 body{background-color:#1E1E1E;color:#D4D4D4;font-family:'Segoe UI','Cascadia Code',Consolas,monospace;font-size:13px;line-height:1.6;padding:12px 16px;overflow-wrap:break-word;word-wrap:break-word}
@@ -53,12 +56,6 @@ th{background:#2D2D2D;color:#E8E8E8;font-weight:600}
 hr{border:none;border-top:1px solid #444;margin:12px 0}
 img{max-width:100%}
 .code-lang{position:absolute;top:4px;left:12px;color:#888;font-size:10px;font-family:'Segoe UI',sans-serif;text-transform:uppercase;letter-spacing:0.5px}
-pre.mermaid-block{background:#1A1A2E;border-color:#3A3A6A;color:#8A8AD4;font-style:italic;padding:12px;text-align:center}
-pre.mermaid-block::before{content:'📊  Mermaid 图表';display:block;color:#6A6AB4;margin-bottom:6px;font-style:normal}
-details{margin:8px 0;border:1px solid #3A3A3A;border-radius:6px;background:#1E1E2E;overflow:hidden}
-details summary{cursor:pointer;padding:6px 12px;color:#8A8A9A;font-size:12px;font-style:italic;background:#252535;user-select:none}
-details summary:hover{color:#A0A0B0}
-details .think-content,details> :not(summary){padding:8px 12px;color:#8A8A9A;font-size:12px;font-style:italic;line-height:1.5}
 .copy-btn{position:absolute;top:4px;right:8px;background:#3C3C3C;color:#CCC;border:1px solid #555;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer;font-family:'Segoe UI',sans-serif;z-index:1}
 .copy-btn:hover{background:#4A4A4A;color:#FFF}
 .copy-btn.copied{background:#1A3A1A;color:#4EC9B0}
@@ -71,187 +68,176 @@ details .think-content,details> :not(summary){padding:8px 12px;color:#8A8A9A;fon
 .avatar{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;font-weight:bold;font-size:14px;flex-shrink:0}
 .avatar-ai{background:#4EC9B0;color:#1E1E1E}
 .avatar-user{background:#569CD6;color:#fff}
+/* ── 思考面板样式 ── */
+.reasoning-panel{margin:6px 0;border:1px solid #3A3A6A;border-radius:6px;background:#1A1A2E;overflow:hidden}
+.reasoning-panel summary{cursor:pointer;padding:6px 12px;color:#8A8AD4;font-size:12px;font-weight:600;background:#252545;user-select:none;list-style:none}
+.reasoning-panel summary::-webkit-details-marker{display:none}
+.reasoning-panel summary::before{content:'🧠 ';margin-right:4px}
+.reasoning-panel summary:hover{color:#A0A0D0}
+.reasoning-panel .reasoning-content{padding:8px 12px;color:#8A8AB4;font-size:12px;font-style:italic;line-height:1.5;white-space:pre-wrap;max-height:300px;overflow-y:auto}
+/* ── 流式光标闪烁 ── */
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.streaming-cursor{display:inline-block;width:8px;height:15px;background:#6CAFD9;margin-left:2px;animation:blink 0.8s infinite;vertical-align:text-bottom}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:#1E1E1E}
 ::-webkit-scrollbar-thumb{background:#444;border-radius:4px}
 ::-webkit-scrollbar-thumb:hover{background:#555}
 ";
 
+        private const string AiAvatarHtml = "<span class='avatar avatar-ai'>AI</span>";
+        private const string UserAvatarHtml = "<span class='avatar avatar-user'>U</span>";
+
         #endregion
 
         #region Public Methods
 
-        public static string BuildChatHtml(IReadOnlyList<ChatMessage> messages, bool isStreaming = false)
+        /// <summary>
+        /// 构建初始完整 HTML 页面（用于首次 NavigateToString）。
+        /// 包含所有消息 + 内嵌 JS 基础设施（增量追加、流式更新、自动滚动等）。
+        /// </summary>
+        public static string BuildInitialPage(IReadOnlyList<ChatMessage> messages)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
             var sb = new StringBuilder();
-
-            int userCount = 0, assistantCount = 0;
             for (int i = 0; i < messages.Count; i++)
             {
                 var msg = messages[i];
                 if (msg.Role == "user")
-                {
-                    AppendUserMessage(sb, msg.Content ?? string.Empty);
-                    userCount++;
-                }
+                    AppendUserMessageHtml(sb, msg.Content ?? string.Empty);
                 else if (msg.Role == "assistant")
-                {
-                    AppendAssistantMessage(sb, msg, i);
-                    assistantCount++;
-                }
+                    AppendAssistantMessageHtml(sb, msg, i);
             }
 
-            string fullHtml = WrapFullPage(sb.ToString(), isStreaming);
-            sw.Stop();
-            System.Diagnostics.Debug.WriteLine(
-                $"[Render] BuildChatHtml: {messages.Count} msgs (user={userCount}, asst={assistantCount}), " +
-                $"bodyLen={sb.Length}, fullHtmlLen={fullHtml.Length}, streaming={isStreaming}, elapsed={sw.ElapsedMilliseconds}ms");
-            return fullHtml;
+            return WrapFullPage(sb.ToString(), hasStreamingMessage: false);
+        }
+
+        /// <summary>
+        /// 构建单条用户消息的 HTML 片段（用于增量追加）。
+        /// </summary>
+        public static string BuildUserMessageHtml(string content)
+        {
+            var sb = new StringBuilder();
+            AppendUserMessageHtml(sb, content);
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 构建单条 AI 消息的 HTML 片段（用于增量追加）。
+        /// </summary>
+        public static string BuildAssistantMessageHtml(ChatMessage msg, int index)
+        {
+            var sb = new StringBuilder();
+            AppendAssistantMessageHtml(sb, msg, index);
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 构建流式更新用的 JS 脚本：更新指定索引的 AI 消息内容和思考面板。
+        /// 返回的 JS 字符串可直接传给 ExecuteScriptAsync。
+        /// </summary>
+        /// <param name="messageIndex">消息在列表中的索引（从0开始）。</param>
+        /// <param name="streamingContent">当前流式累积的正文内容（纯文本）。</param>
+        /// <param name="reasoningContent">当前流式累积的思考内容（纯文本），可为空。</param>
+        /// <param name="isComplete">是否流式已完成（完成后移除光标）。</param>
+        public static string BuildStreamingUpdateJs(int messageIndex, string streamingContent, string reasoningContent, bool isComplete)
+        {
+            string escapedContent = EscapeJsString(streamingContent ?? string.Empty);
+            string escapedReasoning = EscapeJsString(reasoningContent ?? string.Empty);
+
+            return $@"
+(function(){{
+    var container=document.getElementById('msg-body-{messageIndex}');
+    var reasoningPanel=document.getElementById('reasoning-{messageIndex}');
+    var reasoningBody=document.getElementById('reasoning-body-{messageIndex}');
+    var cursor=document.getElementById('cursor-{messageIndex}');
+
+    if(container){{
+        // 流式文本：HTML 编码 + 换行转 &lt;br&gt;
+        var text={escapedContent};
+        var html=text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+        container.innerHTML=html;
+    }}
+
+    if(reasoningPanel && reasoningBody){{
+        var rtext={escapedReasoning};
+        if(rtext.length>0){{
+            reasoningPanel.style.display='block';
+            reasoningBody.textContent=rtext;
+        }}else{{
+            reasoningPanel.style.display='none';
+        }}
+    }}
+
+    if(cursor){{
+        cursor.style.display={(isComplete ? "'none'" : "'inline-block'")};
+    }}
+
+    // 自动滚动到底部
+    window.scrollTo({{top:document.body.scrollHeight,behavior:'smooth'}});
+}})();";
+        }
+
+        /// <summary>
+        /// 构建流式完成后替换为完整 Markdown 渲染的 JS 脚本。
+        /// </summary>
+        public static string BuildFinalRenderJs(int messageIndex, string fullContent, string reasoningContent)
+        {
+            // 在 C# 侧完成 Markdown → HTML 渲染
+            string bodyHtml = RenderMarkdownToHtml(fullContent ?? string.Empty);
+            string escapedBody = EscapeJsString(bodyHtml);
+
+            string reasoningHtml = string.IsNullOrWhiteSpace(reasoningContent)
+                ? string.Empty
+                : RenderReasoningContentHtml(reasoningContent);
+            string escapedReasoningHtml = EscapeJsString(reasoningHtml);
+
+            return $@"
+(function(){{
+    var container=document.getElementById('msg-body-{messageIndex}');
+    var reasoningPanel=document.getElementById('reasoning-{messageIndex}');
+    var reasoningBody=document.getElementById('reasoning-body-{messageIndex}');
+    var cursor=document.getElementById('cursor-{messageIndex}');
+    var msgDiv=document.getElementById('msg-{messageIndex}');
+
+    if(container){{
+        container.innerHTML={escapedBody};
+    }}
+
+    if(cursor) cursor.style.display='none';
+
+    if(reasoningPanel && reasoningBody){{
+        var rhtml={escapedReasoningHtml};
+        if(rhtml.length>0){{
+            reasoningPanel.style.display='block';
+            reasoningBody.innerHTML=rhtml;
+        }}else{{
+            reasoningPanel.style.display='none';
+        }}
+    }}
+
+    // 重新为代码块添加按钮和语言标签
+    if(msgDiv) decorateCodeBlocks(msgDiv);
+
+    window.scrollTo({{top:document.body.scrollHeight,behavior:'smooth'}});
+}})();";
+        }
+
+        /// <summary>
+        /// 获取用于嵌入初始页面的"装饰代码块"JS 函数定义。
+        /// </summary>
+        public static string GetDecorateCodeBlocksJsFunction()
+        {
+            return BuildCodeLangLabelsJs() + BuildCopyBtnJs();
         }
 
         #endregion
 
-        #region Private Methods - Message Bodies
+        #region Private Methods - Message HTML Builders
 
-        private static void AppendAssistantMessage(StringBuilder sb, ChatMessage msg, int idx)
-        {
-            string bodyHtml;
-            if (msg.IsStreaming && !string.IsNullOrEmpty(msg.Content))
-                bodyHtml = BuildStreamingBody(msg.Content);
-            else if (!string.IsNullOrEmpty(msg.Content))
-                bodyHtml = BuildMessageBody(msg.Content);
-            else
-                bodyHtml = "<p style='color:#888;font-style:italic'>思考中…</p>";
-
-            string reasoningPanel = BuildReasoningPanel(msg.ReasoningContent);
-            string streamingDots = msg.IsStreaming
-                ? "<span style='color:#6CAFD9;font-size:10px'>●●●</span>" : "";
-
-            // AI 消息: 头像在左, 气泡在右
-            sb.Append(
-                "<table cellpadding='0' cellspacing='0' border='0' width='100%' style='margin-bottom:14px'>" +
-                "<tr>" +
-                "<td width='36' valign='top'>" + AiAvatarHtml + "</td>" +
-                "<td valign='top'><div class='msg-ai'>" +
-                "<div class='msg-header msg-header-ai'>DeepSeek " + streamingDots + "</div>" +
-                reasoningPanel +
-                "<div class='msg-body'>" + bodyHtml + "</div>" +
-                "</div></td></tr></table>");
-        }
-
-        /// <summary>
-        /// 将 Markdown 文本转换为 HTML 正文内容（不含完整页面包装）。
-        /// 对标 ucChat.AddMessagesHtml 中 AI 消息的处理逻辑：
-        /// 直接使用 Markdig.ToHtml() + 思考块预处理 + Mermaid 后处理。
-        /// 
-        /// 这替代了之前 "MarkdownRenderService.ConvertToHtml → ExtractBodyContent" 的双重包装方案，
-        /// 该方案会导致渲染空白（ExtractBodyContent 剥离脚本后丢失上下文 + 双重 CSS 冲突）。
-        /// </summary>
-        private static string BuildMessageBody(string markdown)
-        {
-            if (string.IsNullOrEmpty(markdown)) return string.Empty;
-            try
-            {
-                string htmlContent;
-
-                // ── 处理 &lt;think&gt;...&lt;/think&gt; 思考块 ──
-                // 对标 ucChat 中 Regex.Match(content, @"^&lt;think&gt;(?&lt;content&gt;.*)&lt;\/think&gt;(?&lt;answer&gt;.*)$") 的逻辑
-                Match thinkMatch = Regex.Match(markdown,
-                    @"^<think>(?<content>.*)</think>(?<answer>.*)$",
-                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
-
-                if (!thinkMatch.Success)
-                {
-                    // 无思考块：直接 Markdown → HTML
-                    htmlContent = Markdown.ToHtml(markdown, MarkdownPipeline);
-                }
-                else
-                {
-                    // 有思考块：思考内容作为 &lt;details&gt; 折叠面板，答案部分正常渲染
-                    string thinkBody = Markdown.ToHtml(thinkMatch.Groups["content"].Value, MarkdownPipeline);
-                    string thinkBlock =
-                        $"<details><summary>🧠 思考过程</summary>{thinkBody}</details>";
-                    string answerHtml = Markdown.ToHtml(thinkMatch.Groups["answer"].Value, MarkdownPipeline);
-                    htmlContent = $"{thinkBlock}\n{answerHtml}";
-                }
-
-                // ── Mermaid 代码块后处理 ──
-                // 修复 Markdig 生成的 Mermaid HTML，统一为 &lt;pre&gt;&lt;code class="language-mermaid"&gt;
-                // 对标 ucChat 和 MarkdownRenderService.PostprocessMermaidBlocks
-                htmlContent = Regex.Replace(htmlContent,
-                    @"<pre\s+class=""mermaid[^""]*""[^>]*>(.*?)</pre>",
-                    m => WrapMermaidCodeBlock(m.Groups[1].Value),
-                    RegexOptions.Singleline);
-
-                htmlContent = Regex.Replace(htmlContent,
-                    @"<div class=""lang-mermaid[^""]*"">(.*?)</div>",
-                    m => WrapMermaidCodeBlock(m.Groups[1].Value),
-                    RegexOptions.Singleline);
-
-                // ── 移除末尾多余的 &lt;br /&gt; ──
-                if (htmlContent.EndsWith("<br />"))
-                {
-                    htmlContent = htmlContent.Substring(0, htmlContent.Length - 6);
-                }
-
-                // ── 防止 XSS：转义残留的 &lt;script&gt; 标签 ──
-                htmlContent = htmlContent
-                    .Replace("<script", "&lt;script")
-                    .Replace("</script>", "&lt;/script&gt;");
-
-                return htmlContent;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Render] BuildMessageBody 异常 (len={markdown.Length}): {ex.Message}");
-                return "<pre>" + System.Net.WebUtility.HtmlEncode(markdown) + "</pre>";
-            }
-        }
-
-        /// <summary>
-        /// 将 Mermaid 原始代码包装为标准格式 &lt;pre&gt;&lt;code class="language-mermaid"&gt;。
-        /// 对标 ucChat 中 Mermaid 代码块处理逻辑。
-        /// </summary>
-        private static string WrapMermaidCodeBlock(string inner)
-        {
-            // 如果包含 SVG（预渲染），只取 SVG 之前的原始代码
-            int svgIdx = inner.IndexOf("<svg", StringComparison.Ordinal);
-            if (svgIdx > 0)
-                inner = inner.Substring(0, svgIdx).Trim();
-
-            inner = System.Net.WebUtility.HtmlDecode(inner);
-            string escaped = System.Net.WebUtility.HtmlEncode(inner);
-            return $"<pre><code class=\"language-mermaid\">{escaped}</code></pre>";
-        }
-
-        private static string BuildStreamingBody(string text)
-        {
-            if (string.IsNullOrEmpty(text)) return string.Empty;
-            return System.Net.WebUtility.HtmlEncode(text).Replace("\n", "<br>");
-        }
-
-        private static string BuildReasoningPanel(string reasoningContent)
-        {
-            if (string.IsNullOrWhiteSpace(reasoningContent)) return string.Empty;
-            string escaped = System.Net.WebUtility.HtmlEncode(reasoningContent);
-            return "<div style='margin:8px 0;border:1px solid #3A3A3A;border-radius:4px;background:#1E1E2E;overflow:hidden'>" +
-                   "<div style='padding:6px 12px;color:#8A8A9A;font-size:12px;font-style:italic;background:#252535'>🧠 思考过程</div>" +
-                   "<div style='padding:8px 12px;color:#8A8A9A;font-size:12px;font-style:italic;line-height:1.5;white-space:pre-wrap'>" +
-                   escaped.Replace("\n", "<br>") + "</div></div>";
-        }
-
-        #endregion
-
-        #region Private Methods - Message Bubbles
-
-        private static void AppendUserMessage(StringBuilder sb, string content)
+        private static void AppendUserMessageHtml(StringBuilder sb, string content)
         {
             string escaped = System.Net.WebUtility.HtmlEncode(content);
             string body = escaped.Replace("\n", "<br>");
 
-            // 用户消息: 气泡在左, 头像在右
             sb.Append(
                 "<table cellpadding='0' cellspacing='0' border='0' width='100%' style='margin-bottom:14px'>" +
                 "<tr>" +
@@ -263,29 +249,244 @@ details .think-content,details> :not(summary){padding:8px 12px;color:#8A8A9A;fon
                 "</tr></table>");
         }
 
-        #endregion
-
-        #region Private Methods - Full Page
-
-        private static string WrapFullPage(string messagesHtml, bool isStreaming)
+        private static void AppendAssistantMessageHtml(StringBuilder sb, ChatMessage msg, int idx)
         {
-            string autoScrollJs = isStreaming ? BuildAutoScrollJs() : "";
+            string bodyHtml;
+            bool isStreaming = msg.IsStreaming;
 
-            return "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'><style>" +
-                   PageCss + "</style></head><body><div id='chat-container'>" +
-                   messagesHtml + "</div><script>" +
-                   BuildCodeLangLabelsJs() + BuildCopyBtnJs() + BuildShiftScrollJs() +
-                   autoScrollJs + "</script></body></html>";
+            if (!string.IsNullOrEmpty(msg.Content))
+            {
+                // 已有内容：完整 Markdown 渲染
+                bodyHtml = RenderMarkdownToHtml(msg.Content);
+            }
+            else if (isStreaming)
+            {
+                // 流式中但尚内容：显示等待提示
+                bodyHtml = "<span style='color:#888;font-style:italic'>思考中…</span>";
+            }
+            else
+            {
+                bodyHtml = string.Empty;
+            }
+
+            string reasoningHtml = RenderReasoningPanelHtml(msg.ReasoningContent, idx);
+
+            string streamingCursor = isStreaming
+                ? "<span class='streaming-cursor' id='cursor-" + idx + "'></span>"
+                : "";
+
+            string streamingDots = isStreaming
+                ? " <span style='color:#6CAFD9;font-size:10px'>●●●</span>" : "";
+
+            sb.Append(
+                "<div id='msg-" + idx + "'>" +
+                "<table cellpadding='0' cellspacing='0' border='0' width='100%' style='margin-bottom:14px'>" +
+                "<tr>" +
+                "<td width='36' valign='top'>" + AiAvatarHtml + "</td>" +
+                "<td valign='top'><div class='msg-ai'>" +
+                "<div class='msg-header msg-header-ai'>DeepSeek" + streamingDots + "</div>" +
+                reasoningHtml +
+                "<div class='msg-body' id='msg-body-" + idx + "'>" + bodyHtml + "</div>" +
+                streamingCursor +
+                "</div></td></tr></table>" +
+                "</div>");
+        }
+
+        /// <summary>
+        /// 构建思考面板 HTML（含 details/summary 包装，带 ID）。
+        /// </summary>
+        private static string RenderReasoningPanelHtml(string reasoningContent, int idx)
+        {
+            if (string.IsNullOrWhiteSpace(reasoningContent)) return string.Empty;
+
+            string body = RenderReasoningContentHtml(reasoningContent);
+
+            return
+                "<details class='reasoning-panel' id='reasoning-" + idx + "' open='true'>" +
+                "<summary>思考过程</summary>" +
+                "<div class='reasoning-content' id='reasoning-body-" + idx + "'>" + body + "</div>" +
+                "</details>";
+        }
+
+        /// <summary>
+        /// 仅构建思考内容的 HTML（无面板包装），用于流式结束后的最终渲染 JS。
+        /// </summary>
+        private static string RenderReasoningContentHtml(string reasoningContent)
+        {
+            if (string.IsNullOrWhiteSpace(reasoningContent)) return string.Empty;
+            string escaped = System.Net.WebUtility.HtmlEncode(reasoningContent);
+            return escaped.Replace("\n", "<br>");
+        }
+
+        /// <summary>
+        /// 将 Markdown 文本渲染为 HTML（使用 Markdig）。
+        /// 对标 ucChat.AddMessagesHtml 中 AI 消息的处理逻辑。
+        /// </summary>
+        private static string RenderMarkdownToHtml(string markdown)
+        {
+            if (string.IsNullOrEmpty(markdown)) return string.Empty;
+
+            try
+            {
+                string htmlContent;
+
+                // ── 处理 <think>...</think> 思考块 ──
+                Match thinkMatch = Regex.Match(markdown,
+                    @"^<think>(?<content>.*)</think>(?<answer>.*)$",
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
+
+                if (!thinkMatch.Success)
+                {
+                    htmlContent = Markdown.ToHtml(markdown, MarkdownPipeline);
+                }
+                else
+                {
+                    string thinkBody = Markdown.ToHtml(thinkMatch.Groups["content"].Value, MarkdownPipeline);
+                    string thinkBlock =
+                        $"<details class='reasoning-panel' open='true'><summary>思考过程</summary><div class='reasoning-content'>{thinkBody}</div></details>";
+                    string answerHtml = Markdown.ToHtml(thinkMatch.Groups["answer"].Value, MarkdownPipeline);
+                    htmlContent = $"{thinkBlock}\n{answerHtml}";
+                }
+
+                // ── Mermaid 代码块后处理 ──
+                htmlContent = Regex.Replace(htmlContent,
+                    @"<pre\s+class=""mermaid[^""]*""[^>]*>(.*?)</pre>",
+                    m => WrapMermaidCodeBlock(m.Groups[1].Value),
+                    RegexOptions.Singleline);
+
+                htmlContent = Regex.Replace(htmlContent,
+                    @"<div class=""lang-mermaid[^""]*"">(.*?)</div>",
+                    m => WrapMermaidCodeBlock(m.Groups[1].Value),
+                    RegexOptions.Singleline);
+
+                // ── 移除末尾多余的 <br /> ──
+                if (htmlContent.EndsWith("<br />"))
+                    htmlContent = htmlContent.Substring(0, htmlContent.Length - 6);
+
+                // ── XSS 防护 ──
+                htmlContent = htmlContent
+                    .Replace("<script", "&lt;script")
+                    .Replace("</script>", "&lt;/script&gt;");
+
+                return htmlContent;
+            }
+            catch
+            {
+                return "<pre>" + System.Net.WebUtility.HtmlEncode(markdown) + "</pre>";
+            }
+        }
+
+        private static string WrapMermaidCodeBlock(string inner)
+        {
+            int svgIdx = inner.IndexOf("<svg", StringComparison.Ordinal);
+            if (svgIdx > 0) inner = inner.Substring(0, svgIdx).Trim();
+            inner = System.Net.WebUtility.HtmlDecode(inner);
+            string escaped = System.Net.WebUtility.HtmlEncode(inner);
+            return $"<pre><code class=\"language-mermaid\">{escaped}</code></pre>";
         }
 
         #endregion
 
-        #region Private Methods - JavaScript Blocks
+        #region Private Methods - Full Page & JS
+
+        private static string WrapFullPage(string messagesHtml, bool hasStreamingMessage)
+        {
+            string autoScrollJs = hasStreamingMessage ? BuildAutoScrollJs() : "";
+
+            return "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'>" +
+                   "<link rel='stylesheet' href='" + HighlightJsCdnStyleDark + "' />" +
+                   "<style>" + PageCss + "</style>" +
+                   "<script src='" + HighlightJsCdnScript + "'></script>" +
+                   "</head><body><div id='chat-container'>" +
+                   messagesHtml + "</div><script>" +
+                   BuildDecorateCodeBlocksJsFunction() +
+                   BuildDecorateAllCodeBlocksInvocation() +
+                   BuildShiftScrollJs() +
+                   autoScrollJs +
+                   BuildAppendMessageJsFunction() +
+                   "</script></body></html>";
+        }
 
         /// <summary>
-        /// 为代码块添加语言标签（纯 CSS 方案，无需 JS 语法高亮）。
-        /// 替代原 BuildHighlightJs，避免 ES6 模板字符串与 C# verbatim 转义冲突导致的渲染错误。
+        /// 声明 decorateCodeBlocks 函数（语言标签 + highlight.js 语法高亮 + 复制/应用按钮）。
+        /// 使用 highlight.js CDN 进行语法高亮，与 VisualChatGPTStudioShared 保持一致。
         /// </summary>
+        private static string BuildDecorateCodeBlocksJsFunction()
+        {
+            return @"
+window.decorateCodeBlocks=function(container){
+    if(!container)return;
+    var pres=container.querySelectorAll('pre:not(.mermaid-block)');
+    pres.forEach(function(pre){
+        if(pre.querySelector('.copy-btn'))return;
+        var code=pre.querySelector('code');
+        if(!code)return;
+        var lang='';
+        if(code.className){
+            var m=code.className.match(/language-(\w+)/);
+            if(m)lang=m[1];
+        }
+        if(lang){
+            var label=document.createElement('span');
+            label.className='code-lang';
+            label.textContent=lang;
+            pre.insertBefore(label,pre.firstChild);
+        }
+        // highlight.js 语法高亮（与 VisualChatGPTStudioShared 保持一致）
+        if(window.hljs){
+            try{window.hljs.highlightElement(code);}catch(e){}
+        }
+        // 复制按钮
+        var copyBtn=document.createElement('button');
+        copyBtn.className='copy-btn';
+        copyBtn.textContent='📋 复制';
+        copyBtn.title='复制代码到剪贴板';
+        copyBtn.onclick=function(){
+            var text=pre.innerText,ok=false;
+            if(navigator.clipboard&&navigator.clipboard.writeText){
+                navigator.clipboard.writeText(text);ok=true;
+            }else{
+                var ta=document.createElement('textarea');
+                ta.value=text;ta.style.cssText='position:fixed;opacity:0';
+                document.body.appendChild(ta);ta.select();
+                try{document.execCommand('copy');ok=true;}catch(e){}
+                document.body.removeChild(ta);
+            }
+            if(ok){copyBtn.textContent='✓ 已复制';copyBtn.classList.add('copied');}
+            setTimeout(function(){copyBtn.textContent='📋 复制';copyBtn.classList.remove('copied');},1500);
+        };
+        pre.appendChild(copyBtn);
+        // 应用按钮
+        var applyBtn=document.createElement('button');
+        applyBtn.className='copy-btn';
+        applyBtn.textContent='⚡ 应用';
+        applyBtn.title='复制代码到剪贴板，请在编辑器中粘贴 (Ctrl+V)';
+        applyBtn.style.right='60px';
+        applyBtn.onclick=function(){
+            var text=pre.innerText,ok=false;
+            if(navigator.clipboard&&navigator.clipboard.writeText){
+                navigator.clipboard.writeText(text);ok=true;
+            }else{
+                var ta=document.createElement('textarea');
+                ta.value=text;ta.style.cssText='position:fixed;opacity:0';
+                document.body.appendChild(ta);ta.select();
+                try{document.execCommand('copy');ok=true;}catch(e){}
+                document.body.removeChild(ta);
+            }
+            if(ok){applyBtn.textContent='✓ 已复制';applyBtn.classList.add('copied');}
+            setTimeout(function(){applyBtn.textContent='⚡ 应用';applyBtn.classList.remove('copied');},1500);
+        };
+        pre.appendChild(applyBtn);
+    });
+};
+";
+        }
+
+        private static string BuildDecorateAllCodeBlocksInvocation()
+        {
+            return "window.decorateCodeBlocks(document.getElementById('chat-container'));";
+        }
+
         private static string BuildCodeLangLabelsJs()
         {
             return @"
@@ -294,7 +495,6 @@ var pres=document.querySelectorAll('pre:not(.mermaid-block)');
 pres.forEach(function(pre){
     var code=pre.querySelector('code');
     if(!code)return;
-    // 提取语言标签并显示在代码块左上角
     var lang='';
     if(code.className){
         var m=code.className.match(/language-(\w+)/);
@@ -310,19 +510,12 @@ pres.forEach(function(pre){
 })();";
         }
 
-        /// <summary>
-        /// 代码块按钮 JS（复制 + 应用）。
-        /// 对标共享项目 ucChat 的 copy-btn + apply-btn。
-        /// 注意："应用"按钮通过 navigator.clipboard 复制代码并提示用户粘贴，
-        /// 而非通过 WebMessageReceived（RemoteUserControl 架构下无法注册该事件）。
-        /// </summary>
         private static string BuildCopyBtnJs()
         {
             return @"
 (function(){
 var pres=document.querySelectorAll('pre:not(.mermaid-block)');
 pres.forEach(function(pre){
-    // ── 复制按钮 ──
     var copyBtn=document.createElement('button');
     copyBtn.className='copy-btn';
     copyBtn.textContent='📋 复制';
@@ -342,14 +535,10 @@ pres.forEach(function(pre){
         setTimeout(function(){copyBtn.textContent='📋 复制';copyBtn.classList.remove('copied');},1500);
     };
     pre.appendChild(copyBtn);
-
-    // ── 应用按钮（对标 ucChat 的 apply-btn） ──
-    // RemoteUserControl 限制：无法注册 CoreWebView2.WebMessageReceived，
-    // 因此改为复制到剪贴板并提示用户粘贴（与 Apply 效果等价，仅多一步 Ctrl+V）。
     var applyBtn=document.createElement('button');
     applyBtn.className='copy-btn';
     applyBtn.textContent='⚡ 应用';
-    applyBtn.title='复制代码到剪贴板，请在编辑器中粘贴 (Ctrl+V)';
+    applyBtn.title='复制代码，请在编辑器中粘贴';
     applyBtn.style.right='60px';
     applyBtn.onclick=function(){
         var text=pre.innerText,ok=false;
@@ -370,9 +559,6 @@ pres.forEach(function(pre){
 })();";
         }
 
-        /// <summary>
-        /// Shift+滚轮横向滚动 JS。
-        /// </summary>
         private static string BuildShiftScrollJs()
         {
             return @"
@@ -386,7 +572,7 @@ document.addEventListener('wheel',function(e){
         }
 
         /// <summary>
-        /// 流式自动滚动 JS（MutationObserver 检测内容变化）。
+        /// 流式自动滚动 JS（MutationObserver）。
         /// </summary>
         private static string BuildAutoScrollJs()
         {
@@ -400,6 +586,36 @@ new MutationObserver(function(){
 })();";
         }
 
+        /// <summary>
+        /// 声明 window.__appendMessageHtml 函数，用于增量追加新消息到页面。
+        /// </summary>
+        private static string BuildAppendMessageJsFunction()
+        {
+            return @"
+window.__appendMessageHtml=function(html){
+    var container=document.getElementById('chat-container');
+    if(!container)return;
+    var temp=document.createElement('div');
+    temp.innerHTML=html;
+    while(temp.firstChild){
+        container.appendChild(temp.firstChild);
+    }
+    window.decorateCodeBlocks(container);
+    window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
+};";
+        }
+
+        /// <summary>
+        /// 转义字符串用于嵌入 JS 字符串字面量。
+        /// </summary>
+        private static string EscapeJsString(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "\"\"";
+            // 使用 JSON 序列化来安全转义
+            return System.Text.Json.JsonSerializer.Serialize(s);
+        }
+
         #endregion
     }
 }
+

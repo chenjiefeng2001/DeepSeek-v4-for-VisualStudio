@@ -1,26 +1,73 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <CommandTable xmlns="http://schemas.microsoft.com/VisualStudio/2005-10-18/CommandTable"
               xmlns:xs="http://www.w3.org/2001/XMLSchema">
 
-  <Extern href="stdidcmd.h"/>
-  <Extern href="vsshlids.h"/>
+	<Extern href="stdidcmd.h"/>
+	<Extern href="vsshlids.h"/>
 
-  <Commands package="DeepSeek_v4_for_VisualStudioPackage">
-    <Buttons>
-      <Button guid="guidDeepSeekCmdSet" id="cmdidShowChatWindow" priority="0x0100" type="Button">
-        <Parent guid="guidSHLMainMenu" id="IDG_VS_WNDO_OTRWNDWS1"/>
-        <Strings>
-          <ButtonText>DeepSeek Chat</ButtonText>
-          <LocCanonicalName>.DeepSeek_v4_for_VisualStudio.ShowChatWindow</LocCanonicalName>
-        </Strings>
-      </Button>
-    </Buttons>
-  </Commands>
+	<Commands package="guidDeepSeekPackage">
 
-  <Symbols>
-    <GuidSymbol name="guidDeepSeekCmdSet" value="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
-      <IDSymbol name="cmdidShowChatWindow" value="0x0100"/>
-    </GuidSymbol>
-  </Symbols>
+		<!-- ═══ 自定义工具栏 ═══ -->
+		<Menus>
+			<Menu guid="guidDeepSeekCmdSet" id="idToolbar" type="Toolbar">
+				<CommandFlag>DefaultDocked</CommandFlag>
+				<Strings>
+					<ButtonText>DeepSeek Chat</ButtonText>
+					<CommandName>DeepSeek Chat</CommandName>
+				</Strings>
+			</Menu>
+		</Menus>
+
+		<!-- ═══ 工具栏上的按钮组 ═══ -->
+		<Groups>
+			<Group guid="guidDeepSeekCmdSet" id="grpToolbarCommands" priority="0x0000">
+				<Parent guid="guidDeepSeekCmdSet" id="idToolbar"/>
+			</Group>
+		</Groups>
+
+		<Buttons>
+			<!-- 视图 → 其他窗口 → DeepSeek Chat -->
+			<Button guid="guidDeepSeekCmdSet" id="cmdidShowChatWindow" priority="0x0100" type="Button">
+				<Parent guid="guidSHLMainMenu" id="IDG_VS_WNDO_OTRWNDWS1"/>
+				<Icon guid="guidImages" id="bmpPic1"/>
+				<Strings>
+					<ButtonText>DeepSeek Chat</ButtonText>
+					<LocCanonicalName>.DeepSeek_v4_for_VisualStudio.ShowChatWindow</LocCanonicalName>
+				</Strings>
+			</Button>
+
+			<!-- 自定义工具栏按钮 -->
+			<Button guid="guidDeepSeekCmdSet" id="cmdidShowChatWindowToolbar" priority="0x0100" type="Button">
+				<Parent guid="guidDeepSeekCmdSet" id="grpToolbarCommands"/>
+				<Icon guid="guidImages" id="bmpPic1"/>
+				<Strings>
+					<ButtonText>打开 DeepSeek Chat</ButtonText>
+					<LocCanonicalName>.DeepSeek_v4_for_VisualStudio.ShowChatWindowToolbar</LocCanonicalName>
+				</Strings>
+			</Button>
+		</Buttons>
+
+		<Bitmaps>
+			<Bitmap guid="guidImages" href="Resources\DeepSeekIcon.png" usedList="bmpPic1"/>
+		</Bitmaps>
+	</Commands>
+
+	<!-- ═══ 符号定义 ═══ -->
+	<Symbols>
+		<!-- 包 GUID 符号：必须与 DeepSeek_v4_for_VisualStudioPackage 的 [Guid] 一致 -->
+		<GuidSymbol name="guidDeepSeekPackage" value="{7a5b2771-22cb-4337-b445-8d97e3189b64}">
+		</GuidSymbol>
+
+		<GuidSymbol name="guidDeepSeekCmdSet" value="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
+			<IDSymbol name="cmdidShowChatWindow" value="0x0100"/>
+			<IDSymbol name="cmdidShowChatWindowToolbar" value="0x0101"/>
+			<IDSymbol name="idToolbar" value="0x2000"/>
+			<IDSymbol name="grpToolbarCommands" value="0x3000"/>
+		</GuidSymbol>
+
+		<GuidSymbol name="guidImages" value="{B2C3D4E5-F6A7-8901-BCDE-F12345678901}">
+			<IDSymbol name="bmpPic1" value="1"/>
+		</GuidSymbol>
+	</Symbols>
 
 </CommandTable>

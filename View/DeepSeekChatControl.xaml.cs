@@ -18,7 +18,10 @@ namespace DeepSeek_v4_for_VisualStudio.View
 {
     /// <summary>
     /// DeepSeek Chat 主控件，对标共享项目 ucChat。
-    /// 直接宿主 WebView2（Chromium），使用 NavigateToString 渲染聊天内容。
+    /// 宿主 WebView2（Chromium），采用增量渲染模式：
+    /// - 首次加载使用 NavigateToString 构建完整页面
+    /// - 后续消息通过 ExecuteScriptAsync 调用 JS 增量追加
+    /// - 流式输出时通过 BuildStreamingUpdateJs 实时更新 DOM，消除全页刷新闪烁
     /// </summary>
     public partial class DeepSeekChatControl : System.Windows.Controls.UserControl, IDisposable
     {
@@ -33,6 +36,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
             "请通过菜单 **工具 → 选项 → DeepSeek Chat** 配置你的 DeepSeek API 密钥。\n\n" +
             "获取密钥：https://platform.deepseek.com/api_keys";
 
+        /// <summary>
+        /// 流式更新间隔（字符数），每累积这么多字符触发一次 DOM 更新。
+        /// </summary>
+        private const int StreamRenderInterval = 15;
+
         #endregion
 
         #region Properties
@@ -46,7 +54,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
         private readonly List<ChatMessage> _messages = new();
         private readonly List<ChatApiMessage> _conversationHistory = new();
         private bool _isGenerating;
-        private bool _webViewInitialized;
+
+        // ── 增量渲染状态（对标 Turbo ucChat） ──
+        private bool _browserInitialized;
+        private int _lastRenderedMessagesLength;
+        private readonly StringBuilder _messagesHtml = new();
 
         #endregion
 
@@ -85,13 +97,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
             _package = package;
             _options = package.Options;
 
-            // 初始化 API 服务
             InitializeApiService();
-
-            // 解析解决方案路径
             _ = ResolveSolutionPathAsync();
-
-            // 加载对话历史
             _ = LoadAndShowAsync();
         }
 
@@ -131,6 +138,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
         private async Task LoadAndShowAsync()
         {
+            _messagesHtml.Clear();
+            _lastRenderedMessagesLength = 0;
+
             // 加载对话历史
             var loaded = ChatPersistenceService.Load(_solutionPath);
             if (loaded != null && loaded.Count > 0)
@@ -155,7 +165,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 }
             }
 
-            // 没有消息则显示欢迎语（含 API 密钥检查提示）
+            // 没有消息则显示欢迎语
             if (_messages.Count == 0)
             {
                 bool hasApiKey = _options != null && !string.IsNullOrEmpty(_options.ApiKey);
@@ -172,14 +182,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 Logger.Info(hasApiKey ? "[Render] 添加欢迎语" : "[Render] 添加欢迎语 + API密钥缺失警告");
             }
 
-            // 初始化 WebView2 环境并渲染
             await InitializeWebViewAsync();
         }
 
-        /// <summary>
-        /// 初始化 WebView2 并首次渲染。
-        /// 对标 ucChat.UpdateBrowser() 中 EnsureCoreWebView2Async 的逻辑。
-        /// </summary>
         private async Task InitializeWebViewAsync()
         {
             try
@@ -197,7 +202,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
             {
                 Logger.Error("[Render] WebView2 初始化失败", ex);
                 StatusLabel.Text = $"WebView2 初始化失败: {ex.Message}";
-                return;
             }
         }
 
@@ -206,37 +210,74 @@ namespace DeepSeek_v4_for_VisualStudio.View
         #region Private Methods - Rendering
 
         /// <summary>
-        /// 对标 ucChat.UpdateBrowser() + NavigateToString。
+        /// 增量更新浏览器内容。
+        /// 对标 ucChat.UpdateBrowser()：首次使用 NavigateToString，
+        /// 后续通过 ExecuteScriptAsync 调用 window.__appendMessageHtml 增量追加。
         /// </summary>
-        private void RenderMessages(bool isStreaming = false)
+        private async void UpdateBrowser()
         {
             if (ChatWebView.CoreWebView2 == null)
                 return;
 
             try
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                var msgs = _messages.ToList();
-                int userCount = msgs.Count(m => m.Role == "user");
-                int asstCount = msgs.Count(m => m.Role == "assistant");
-                Logger.Info($"[Render] RenderMessages: {msgs.Count} msgs (user={userCount}, asst={asstCount}), streaming={isStreaming}");
+                string allMessages = _messagesHtml.ToString();
 
-                string html = ChatHtmlService.BuildChatHtml(msgs, isStreaming);
-                Logger.Info($"[Render] HTML 构建完成: {html.Length} 字符");
+                // ── 增量更新路径 ──
+                if (_browserInitialized && allMessages.Length > _lastRenderedMessagesLength)
+                {
+                    string delta = allMessages.Substring(_lastRenderedMessagesLength);
+                    string jsFragment = System.Text.Json.JsonSerializer.Serialize(delta);
 
+                    try
+                    {
+                        string script = $"window.__appendMessageHtml({jsFragment});";
+                        await ChatWebView.CoreWebView2.ExecuteScriptAsync(script);
+                        _lastRenderedMessagesLength = allMessages.Length;
+                        return;
+                    }
+                    catch
+                    {
+                        // 增量更新失败时回退到全量刷新
+                    }
+                }
+
+                // ── 全量刷新路径 ──
+                string html = ChatHtmlService.BuildInitialPage(_messages);
                 ChatWebView.CoreWebView2.NavigateToString(html);
-                sw.Stop();
-                Logger.Info($"[Render] NavigateToString 完成, 耗时={sw.ElapsedMilliseconds}ms");
+                _browserInitialized = true;
+                _lastRenderedMessagesLength = allMessages.Length;
             }
             catch (Exception ex)
             {
-                Logger.Error($"[Render] RenderMessages 异常: {ex.Message}", ex);
+                Logger.Error($"[Render] UpdateBrowser 异常: {ex.Message}", ex);
+            }
+        }
+
+        /// <summary>
+        /// 构建消息 HTML 片段并追加到 _messagesHtml，然后更新浏览器。
+        /// </summary>
+        private void AddMessagesHtml(string role, string content, string? reasoningContent = null)
+        {
+            if (role == "user")
+            {
+                _messagesHtml.Append(ChatHtmlService.BuildUserMessageHtml(content));
+            }
+            else
+            {
+                var tempMsg = new ChatMessage
+                {
+                    Role = "assistant",
+                    Content = content,
+                    ReasoningContent = reasoningContent ?? string.Empty,
+                    IsStreaming = false,
+                };
+                _messagesHtml.Append(ChatHtmlService.BuildAssistantMessageHtml(tempMsg, _messages.Count - 1));
             }
         }
 
         /// <summary>
         /// CoreWebView2 初始化完成回调。
-        /// 对标 ucChat 在 EnsureCoreWebView2Async 之后的首次渲染 + WebMessageReceived 注册。
         /// </summary>
         private void ChatWebView_CoreWebView2InitializationCompleted(object? sender, CoreWebView2InitializationCompletedEventArgs e)
         {
@@ -245,8 +286,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 Logger.Info("[Render] CoreWebView2InitializationCompleted: 成功");
                 ChatWebView.CoreWebView2.WebMessageReceived += CoreWebView2_WebMessageReceived;
 
-                // 首次渲染
-                Dispatcher.Invoke(() => RenderMessages());
+                // 构建初始 HTML 内容
+                RebuildMessagesHtml();
+                Dispatcher.Invoke(() => UpdateBrowser());
             }
             else
             {
@@ -256,6 +298,27 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     StatusLabel.Text = $"WebView2 初始化失败: {e.InitializationException?.Message}";
                 });
             }
+        }
+
+        /// <summary>
+        /// 根据 _messages 列表重建 _messagesHtml。
+        /// </summary>
+        private void RebuildMessagesHtml()
+        {
+            _messagesHtml.Clear();
+            for (int i = 0; i < _messages.Count; i++)
+            {
+                var msg = _messages[i];
+                if (msg.Role == "user")
+                {
+                    _messagesHtml.Append(ChatHtmlService.BuildUserMessageHtml(msg.Content ?? string.Empty));
+                }
+                else
+                {
+                    _messagesHtml.Append(ChatHtmlService.BuildAssistantMessageHtml(msg, i));
+                }
+            }
+            _lastRenderedMessagesLength = 0;
         }
 
         #endregion
@@ -270,7 +333,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
             if (string.IsNullOrEmpty(userText))
                 return;
 
-            // 校验 API 密钥：未配置时在聊天窗口显示提醒
+            // 校验 API 密钥
             if (_options == null || string.IsNullOrEmpty(_options.ApiKey))
             {
                 var warningMsg = new ChatMessage
@@ -281,19 +344,19 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     IsRendered = true,
                 };
                 _messages.Add(warningMsg);
-                RenderMessages();
+                AddMessagesHtml("assistant", ApiKeyMissingMessage);
+                UpdateBrowser();
                 StatusLabel.Text = "⚠️ 请先配置 API 密钥 (工具 → 选项 → DeepSeek Chat)";
-                Logger.Info("[Render] API密钥缺失，已显示提醒");
                 return;
             }
 
-            // 热重载 API 服务（API key 可能已更改）
+            // 热重载 API 服务
             InitializeApiService();
             if (_apiService == null) return;
 
             InputTextBox.Text = string.Empty;
 
-            // 添加用户消息
+            // ── 添加用户消息 ──
             var userMsg = new ChatMessage
             {
                 Role = "user",
@@ -302,21 +365,28 @@ namespace DeepSeek_v4_for_VisualStudio.View
             };
             _messages.Add(userMsg);
             _conversationHistory.Add(new ChatApiMessage { Role = "user", Content = userText });
-            RenderMessages();
 
-            // 创建助手消息占位
+            // ── 创建助手消息占位 ──
             var assistantMsg = new ChatMessage
             {
                 Role = "assistant",
                 Content = string.Empty,
+                ReasoningContent = string.Empty,
                 Timestamp = DateTime.Now,
                 IsStreaming = true,
                 IsRendered = false,
             };
             _messages.Add(assistantMsg);
+            int assistantMsgIndex = _messages.Count - 1;
+
+            // ── 批量构建 HTML（用户消息 + 助手占位），仅调用一次 UpdateBrowser 避免竞态重复渲染 ──
+            AddMessagesHtml("user", userText);
+            AddMessagesHtml("assistant", string.Empty);
+            UpdateBrowser();
 
             _isGenerating = true;
             UpdateButtonsState();
+            StatusLabel.Text = "DeepSeek 思考中…";
 
             _currentStreamingCts?.Cancel();
             _currentStreamingCts?.Dispose();
@@ -326,12 +396,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
             {
                 var requestMessages = BuildRequestMessages();
                 var reasoningBuffer = new StringBuilder();
+                var contentBuffer = new StringBuilder();
                 int streamRenderTick = 0;
-                int streamRenderCount = 0;
-                const int ReasoningFlushInterval = 50;
-                const int StreamRenderInterval = 30;
-
-                RenderMessages(isStreaming: true);
+                int lastReasoningLength = 0;
 
                 await foreach (var chunk in _apiService.ChatStreamAsync(requestMessages, _currentStreamingCts.Token))
                 {
@@ -341,64 +408,82 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         reasoningBuffer.Append(thinking);
                         StatusLabel.Text = "DeepSeek 深度思考中…";
 
-                        if (reasoningBuffer.Length >= ReasoningFlushInterval)
+                        // 定期更新思考面板
+                        if (reasoningBuffer.Length - lastReasoningLength >= 80)
                         {
                             assistantMsg.ReasoningContent = reasoningBuffer.ToString();
-                            reasoningBuffer.Clear();
+                            lastReasoningLength = reasoningBuffer.Length;
+                            await UpdateStreamingMessageAsync(assistantMsgIndex,
+                                contentBuffer.ToString(),
+                                reasoningBuffer.ToString(),
+                                isComplete: false);
                         }
                     }
                     else
                     {
-                        if (reasoningBuffer.Length > 0)
+                        if (reasoningBuffer.Length > 0 && lastReasoningLength < reasoningBuffer.Length)
                         {
-                            assistantMsg.ReasoningContent += reasoningBuffer.ToString();
-                            reasoningBuffer.Clear();
+                            assistantMsg.ReasoningContent = reasoningBuffer.ToString();
+                            lastReasoningLength = reasoningBuffer.Length;
                         }
 
-                        assistantMsg.Content += chunk;
+                        contentBuffer.Append(chunk);
                         streamRenderTick += chunk.Length;
                         StatusLabel.Text = "DeepSeek 回复中...";
 
                         if (streamRenderTick >= StreamRenderInterval)
                         {
                             streamRenderTick = 0;
-                            streamRenderCount++;
-                            RenderMessages(isStreaming: true);
+                            assistantMsg.Content = contentBuffer.ToString();
+                            await UpdateStreamingMessageAsync(assistantMsgIndex,
+                                contentBuffer.ToString(),
+                                reasoningBuffer.ToString(),
+                                isComplete: false);
                         }
                     }
                 }
 
-                if (reasoningBuffer.Length > 0)
-                    assistantMsg.ReasoningContent += reasoningBuffer.ToString();
-
+                // ── 流式完成：渲染最终 Markdown ──
+                assistantMsg.ReasoningContent = reasoningBuffer.ToString();
+                assistantMsg.Content = contentBuffer.ToString();
                 assistantMsg.IsStreaming = false;
-                Logger.Info($"[Render] 流式结束: {streamRenderCount} 次增量渲染, 内容长度={assistantMsg.Content.Length}");
-                RenderMessages(isStreaming: false);
 
-                _conversationHistory.Add(new ChatApiMessage { Role = "assistant", Content = assistantMsg.Content });
+                Logger.Info($"[Render] 流式结束: 内容长度={contentBuffer.Length}, 思考长度={reasoningBuffer.Length}");
+
+                string finalJs = ChatHtmlService.BuildFinalRenderJs(
+                    assistantMsgIndex,
+                    contentBuffer.ToString(),
+                    reasoningBuffer.ToString());
+
+                await ChatWebView.CoreWebView2.ExecuteScriptAsync(finalJs);
+
+                _conversationHistory.Add(new ChatApiMessage { Role = "assistant", Content = contentBuffer.ToString() });
 
                 // 后台持久化
                 var capturedMsg = assistantMsg;
+                var capturedMessages = _messages.ToList();
                 _ = Task.Run(() =>
                 {
-                    capturedMsg.HtmlContent = MarkdownRenderService.ConvertToHtml(capturedMsg.Content, _messages.IndexOf(capturedMsg));
+                    capturedMsg.HtmlContent = "rendered";
                     capturedMsg.IsRendered = true;
-                    ChatPersistenceService.Save(_solutionPath, _messages.ToList());
+                    ChatPersistenceService.Save(_solutionPath, capturedMessages);
                 });
             }
             catch (OperationCanceledException)
             {
-                Logger.Info($"[Render] 用户停止生成");
+                Logger.Info("[Render] 用户停止生成");
                 assistantMsg.Content += "\n\n*[已停止]*";
                 assistantMsg.IsStreaming = false;
-                RenderMessages(isStreaming: false);
+                await UpdateStreamingMessageAsync(assistantMsgIndex,
+                    assistantMsg.Content, assistantMsg.ReasoningContent, isComplete: true);
             }
             catch (Exception ex)
             {
                 Logger.Error($"[Render] API 出错", ex);
                 assistantMsg.Content = $"抱歉，发生了错误，请重试。\n\n```\n{ex.Message}\n```";
                 assistantMsg.IsStreaming = false;
-                RenderMessages(isStreaming: false);
+                await UpdateStreamingMessageAsync(assistantMsgIndex,
+                    assistantMsg.Content, assistantMsg.ReasoningContent, isComplete: true);
             }
             finally
             {
@@ -408,6 +493,24 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 _currentStreamingCts?.Dispose();
                 _currentStreamingCts = null;
                 UpdateButtonsState();
+            }
+        }
+
+        /// <summary>
+        /// 通过 JS 增量更新流式消息的 DOM 内容。
+        /// </summary>
+        private async Task UpdateStreamingMessageAsync(int messageIndex, string content, string reasoningContent, bool isComplete)
+        {
+            if (ChatWebView.CoreWebView2 == null) return;
+
+            try
+            {
+                string js = ChatHtmlService.BuildStreamingUpdateJs(messageIndex, content, reasoningContent, isComplete);
+                await ChatWebView.CoreWebView2.ExecuteScriptAsync(js);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[Render] UpdateStreamingMessage 异常: {ex.Message}", ex);
             }
         }
 
@@ -434,7 +537,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
             _currentStreamingCts?.Cancel();
         }
 
-        private void ClearConversation()
+        private async void ClearConversationAsync()
         {
             if (_isGenerating)
             {
@@ -445,9 +548,10 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
             _messages.Clear();
             _conversationHistory.Clear();
+            _messagesHtml.Clear();
+            _lastRenderedMessagesLength = 0;
             ChatPersistenceService.Delete(_solutionPath);
 
-            // 重新添加欢迎语
             var welcomeMsg = new ChatMessage
             {
                 Role = "assistant",
@@ -457,7 +561,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
             };
             _messages.Add(welcomeMsg);
 
-            RenderMessages();
+            RebuildMessagesHtml();
+            _browserInitialized = false;
+            UpdateBrowser();
             Logger.Info("清空对话完成");
         }
 
@@ -475,12 +581,116 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
         #endregion
 
-        #region Event Handlers - WebView2
+        #region Event Handlers - Input
 
         /// <summary>
-        /// 处理 WebView2 JS → C# 消息。
-        /// 对标 ucChat.CoreWebView2_WebMessageReceived。
+        /// 输入框键盘事件：Enter 直接发送消息，Ctrl+Enter 插入换行。
         /// </summary>
+        private void InputTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter)
+            {
+                if (Keyboard.Modifiers == ModifierKeys.Control)
+                {
+                    // Ctrl+Enter: 插入换行
+                    e.Handled = false;
+                    return;
+                }
+
+                // 普通 Enter: 发送消息
+                e.Handled = true;
+                SendMessageAsync();
+            }
+        }
+
+        private void SendButton_Click(object sender, RoutedEventArgs e)
+        {
+            SendMessageAsync();
+        }
+
+        private void StopButton_Click(object sender, RoutedEventArgs e)
+        {
+            StopGeneration();
+        }
+
+        private void ClearButton_Click(object sender, RoutedEventArgs e)
+        {
+            ClearConversationAsync();
+        }
+
+        private void NewChatButton_Click(object sender, RoutedEventArgs e)
+        {
+            // 停止当前生成
+            if (_isGenerating)
+            {
+                _currentStreamingCts?.Cancel();
+                _isGenerating = false;
+                UpdateButtonsState();
+            }
+
+            // 保存当前对话
+            if (_messages.Count > 1)
+            {
+                ChatPersistenceService.Save(_solutionPath, _messages);
+            }
+
+            // 清空并开始新对话
+            _messages.Clear();
+            _conversationHistory.Clear();
+            _messagesHtml.Clear();
+            _lastRenderedMessagesLength = 0;
+
+            var welcomeMsg = new ChatMessage
+            {
+                Role = "assistant",
+                Content = WelcomeMessage,
+                Timestamp = DateTime.Now,
+                IsRendered = true,
+            };
+            _messages.Add(welcomeMsg);
+
+            RebuildMessagesHtml();
+            _browserInitialized = false;
+            UpdateBrowser();
+
+            InputTextBox.Focus();
+            Logger.Info("开始新对话");
+        }
+
+        private void ModelComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_apiService != null && ModelComboBox.SelectedItem is string model)
+            {
+                _apiService.UpdateModel(model);
+                Logger.Info($"模型切换为: {model}");
+            }
+        }
+
+        private void ThinkingCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (_apiService != null)
+            {
+                bool enabled = ThinkingCheckBox.IsChecked == true;
+                string effort = EffortComboBox.SelectedItem as string ?? "high";
+                _apiService.ConfigureThinking(enabled, effort);
+                Logger.Info($"思考模式: {(enabled ? "启用" : "禁用")}, 强度: {effort}");
+            }
+        }
+
+        private void EffortComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_apiService != null && EffortComboBox.SelectedItem is string effort)
+            {
+                bool enabled = ThinkingCheckBox.IsChecked == true;
+                _apiService.ConfigureThinking(enabled, effort);
+                Logger.Info($"推理强度切换为: {effort}");
+            }
+        }
+
+        #endregion
+
+        #region Event Handlers - WebView2
+
         private void CoreWebView2_WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
             try
@@ -502,85 +712,34 @@ namespace DeepSeek_v4_for_VisualStudio.View
             }
             catch (Exception ex)
             {
-                Logger.Error($"WebMessageReceived 处理失败: {ex.Message}", ex);
+                Logger.Error($"WebMessage 处理异常: {ex.Message}", ex);
             }
         }
 
         private void ApplyCodeToActiveDocument(string code)
         {
-            if (string.IsNullOrEmpty(code)) return;
-            Microsoft.VisualStudio.Shell.ThreadHelper.JoinableTaskFactory.Run(async () =>
+            if (string.IsNullOrWhiteSpace(code)) return;
+
+            _ = Microsoft.VisualStudio.Shell.ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
                 await Microsoft.VisualStudio.Shell.ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
                 try
                 {
                     var dte = (EnvDTE.DTE)Microsoft.VisualStudio.Shell.Package.GetGlobalService(typeof(EnvDTE.DTE));
                     var doc = dte?.ActiveDocument;
-                    if (doc == null)
+                    if (doc != null)
                     {
-                        Logger.Error("没有活动文档可插入代码");
-                        return;
+                        var textDoc = (EnvDTE.TextDocument)doc.Object("TextDocument");
+                        var editPoint = textDoc.StartPoint.CreateEditPoint();
+                        editPoint.ReplaceText(textDoc.EndPoint, code, 0);
+                        Logger.Info("代码已应用到活动文档");
                     }
-
-                    var selection = doc.Selection as EnvDTE.TextSelection;
-                    selection?.Insert(code);
-                    Logger.Info("代码已插入编辑器");
                 }
                 catch (Exception ex)
                 {
-                    Logger.Error($"插入代码失败: {ex.Message}", ex);
+                    Logger.Error($"应用代码失败: {ex.Message}", ex);
                 }
             });
-        }
-
-        #endregion
-
-        #region Event Handlers - UI Controls
-
-        private void SendButton_Click(object sender, RoutedEventArgs e) => SendMessageAsync();
-
-        private void StopButton_Click(object sender, RoutedEventArgs e) => StopGeneration();
-
-        private void ClearButton_Click(object sender, RoutedEventArgs e) => ClearConversation();
-
-        private void InputTextBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            // Enter 发送（不按 Shift）
-            if (e.Key == Key.Enter && Keyboard.Modifiers != ModifierKeys.Shift)
-            {
-                e.Handled = true;
-                SendMessageAsync();
-            }
-        }
-
-        private void ModelComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (_apiService != null && ModelComboBox.SelectedItem is string model)
-            {
-                _apiService.UpdateModel(model);
-                Logger.Info($"模型切换至: {model}");
-            }
-        }
-
-        private void ThinkingCheckBox_Changed(object sender, RoutedEventArgs e)
-        {
-            if (_apiService != null && ThinkingCheckBox.IsChecked.HasValue)
-            {
-                bool enabled = ThinkingCheckBox.IsChecked.Value;
-                string effort = EffortComboBox.SelectedItem as string ?? "high";
-                _apiService.ConfigureThinking(enabled, effort);
-                EffortComboBox.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                Logger.Info($"深度思考: {enabled}, 推理强度: {effort}");
-            }
-        }
-
-        private void EffortComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (_apiService != null && EffortComboBox.SelectedItem is string effort && ThinkingCheckBox.IsChecked.HasValue)
-            {
-                _apiService.ConfigureThinking(ThinkingCheckBox.IsChecked.Value, effort);
-                Logger.Info($"推理强度切换: {effort}");
-            }
         }
 
         #endregion
@@ -588,22 +747,20 @@ namespace DeepSeek_v4_for_VisualStudio.View
         #region IDisposable
 
         /// <summary>
-        /// 释放资源。
+        /// 释放资源，保存对话。
         /// </summary>
         public void Dispose()
         {
-            Logger.Info("DeepSeekChatControl Dispose");
-
-            // 保存对话
-            ChatPersistenceService.Save(_solutionPath, _messages.ToList());
-
             _currentStreamingCts?.Cancel();
             _currentStreamingCts?.Dispose();
             _apiService?.Dispose();
 
-            ChatWebView.CoreWebView2InitializationCompleted -= ChatWebView_CoreWebView2InitializationCompleted;
-            if (ChatWebView.CoreWebView2 != null)
-                ChatWebView.CoreWebView2.WebMessageReceived -= CoreWebView2_WebMessageReceived;
+            if (_messages.Count > 0)
+            {
+                ChatPersistenceService.Save(_solutionPath, _messages);
+            }
+
+            Logger.Info("DeepSeekChatControl 已释放");
         }
 
         #endregion

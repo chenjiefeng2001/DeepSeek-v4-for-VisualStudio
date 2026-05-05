@@ -221,6 +221,10 @@
 
                     <!-- 右侧: 操作按钮 -->
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
+                        <Button Content="+ 新对话" Click="NewChatButton_Click"
+                                Style="{StaticResource TransparentButton}"
+                                Margin="0,0,8,0" FontSize="12"
+                                Foreground="#4EC9B0" />
                         <Button Content="清空" Click="ClearButton_Click"
                                 Style="{StaticResource TransparentButton}"
                                 Margin="0,0,4,0" />
