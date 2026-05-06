@@ -1,4 +1,4 @@
-using DeepSeek_v4_for_VisualStudio.Models;
+﻿using DeepSeek_v4_for_VisualStudio.Models;
 using Markdig;
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services
     /// 将聊天消息列表构建为 HTML 页面，用于 WebView2 (Chromium) 渲染。
     /// 支持增量渲染：初始全页 NavigateToString + 后续 ExecuteScriptAsync 增量追加，
     /// 消除流式输出时的全页刷新闪烁。
-    /// 对标 VisualChatGPTStudioShared ucChat 的 UpdateBrowser / AddMessagesHtml 模式。
     /// </summary>
     public static class ChatHtmlService
     {
@@ -25,7 +24,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             .DisableHtml()
             .Build();
 
-        /// <summary>highlight.js CDN - 语法高亮脚本（与 VisualChatGPTStudioShared 保持一致）</summary>
+        /// <summary>highlight.js CDN - 语法高亮脚本</summary>
         private const string HighlightJsCdnScript = "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js";
 
         /// <summary>highlight.js CDN - 暗色主题 CSS</summary>
@@ -235,18 +234,16 @@ img{max-width:100%}
 
         private static void AppendUserMessageHtml(StringBuilder sb, string content)
         {
-            string escaped = System.Net.WebUtility.HtmlEncode(content);
+            string escaped = System.Net.WebUtility.HtmlEncode((content ?? string.Empty).Trim());
             string body = escaped.Replace("\n", "<br>");
 
             sb.Append(
-                "<table cellpadding='0' cellspacing='0' border='0' width='100%' style='margin-bottom:14px'>" +
-                "<tr>" +
-                "<td valign='top'><div class='msg-user'>" +
-                "<div class='msg-header msg-header-user'>你</div>" +
+                "<div style='display:flex;justify-content:flex-end;margin-bottom:14px'>" +
+                "<div class='msg-user' style='max-width:85%;display:inline-block;text-align:left'>" +
                 "<div class='msg-body'>" + body + "</div>" +
-                "</div></td>" +
-                "<td width='36' valign='top'>" + UserAvatarHtml + "</td>" +
-                "</tr></table>");
+                "</div>" +
+                "<div style='margin-left:10px'>" + UserAvatarHtml + "</div>" +
+                "</div>");
         }
 
         private static void AppendAssistantMessageHtml(StringBuilder sb, ChatMessage msg, int idx)
@@ -297,12 +294,12 @@ img{max-width:100%}
         /// </summary>
         private static string RenderReasoningPanelHtml(string reasoningContent, int idx)
         {
-            if (string.IsNullOrWhiteSpace(reasoningContent)) return string.Empty;
-
-            string body = RenderReasoningContentHtml(reasoningContent);
+            bool hasContent = !string.IsNullOrWhiteSpace(reasoningContent);
+            string displayStyle = hasContent ? "block" : "none";
+            string body = hasContent ? RenderReasoningContentHtml(reasoningContent) : string.Empty;
 
             return
-                "<details class='reasoning-panel' id='reasoning-" + idx + "' open='true'>" +
+                "<details class='reasoning-panel' id='reasoning-" + idx + "' open='true' style='display:" + displayStyle + "'>" +
                 "<summary>思考过程</summary>" +
                 "<div class='reasoning-content' id='reasoning-body-" + idx + "'>" + body + "</div>" +
                 "</details>";
@@ -404,12 +401,13 @@ img{max-width:100%}
                    BuildShiftScrollJs() +
                    autoScrollJs +
                    BuildAppendMessageJsFunction() +
+                   "setTimeout(function(){window.scrollTo(0,document.body.scrollHeight);},50);" +
                    "</script></body></html>";
         }
 
         /// <summary>
         /// 声明 decorateCodeBlocks 函数（语言标签 + highlight.js 语法高亮 + 复制/应用按钮）。
-        /// 使用 highlight.js CDN 进行语法高亮，与 VisualChatGPTStudioShared 保持一致。
+        /// 使用 highlight.js CDN 进行语法高亮
         /// </summary>
         private static string BuildDecorateCodeBlocksJsFunction()
         {
@@ -432,7 +430,7 @@ window.decorateCodeBlocks=function(container){
             label.textContent=lang;
             pre.insertBefore(label,pre.firstChild);
         }
-        // highlight.js 语法高亮（与 VisualChatGPTStudioShared 保持一致）
+        // highlight.js 语法高亮
         if(window.hljs){
             try{window.hljs.highlightElement(code);}catch(e){}
         }
@@ -442,7 +440,8 @@ window.decorateCodeBlocks=function(container){
         copyBtn.textContent='📋 复制';
         copyBtn.title='复制代码到剪贴板';
         copyBtn.onclick=function(){
-            var text=pre.innerText,ok=false;
+            var target=pre.querySelector('code')||pre;
+            var text=target.innerText,ok=false;
             if(navigator.clipboard&&navigator.clipboard.writeText){
                 navigator.clipboard.writeText(text);ok=true;
             }else{
@@ -463,7 +462,8 @@ window.decorateCodeBlocks=function(container){
         applyBtn.title='复制代码到剪贴板，请在编辑器中粘贴 (Ctrl+V)';
         applyBtn.style.right='60px';
         applyBtn.onclick=function(){
-            var text=pre.innerText,ok=false;
+            var target=pre.querySelector('code')||pre;
+            var text=target.innerText,ok=false;
             if(navigator.clipboard&&navigator.clipboard.writeText){
                 navigator.clipboard.writeText(text);ok=true;
             }else{
@@ -521,7 +521,8 @@ pres.forEach(function(pre){
     copyBtn.textContent='📋 复制';
     copyBtn.title='复制代码到剪贴板';
     copyBtn.onclick=function(){
-        var text=pre.innerText,ok=false;
+        var target=pre.querySelector('code')||pre;
+        var text=target.innerText,ok=false;
         if(navigator.clipboard&&navigator.clipboard.writeText){
             navigator.clipboard.writeText(text);ok=true;
         }else{
@@ -541,7 +542,8 @@ pres.forEach(function(pre){
     applyBtn.title='复制代码，请在编辑器中粘贴';
     applyBtn.style.right='60px';
     applyBtn.onclick=function(){
-        var text=pre.innerText,ok=false;
+        var target=pre.querySelector('code')||pre;
+        var text=target.innerText,ok=false;
         if(navigator.clipboard&&navigator.clipboard.writeText){
             navigator.clipboard.writeText(text);ok=true;
         }else{
