@@ -1,8 +1,12 @@
-using DeepSeek_v4_for_VisualStudio.Models;
+﻿using DeepSeek_v4_for_VisualStudio.Models;
 using DeepSeek_v4_for_VisualStudio.Utils;
+using Microsoft.VisualStudio.Shell;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -180,6 +184,396 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             sb.AppendLine("请输出你的发现。");
 
             return sb.ToString();
+        }
+
+        #endregion
+
+        #region Solution Discovery
+
+        /// <summary>
+        /// 可自动发现的源代码文件扩展名集合。
+        /// </summary>
+        private static readonly HashSet<string> SourceFileExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".cs", ".vb", ".cpp", ".c", ".h", ".hpp", ".fs", ".fsx",
+            ".xaml", ".xml", ".json", ".config", ".csproj", ".vbproj",
+            ".py", ".js", ".ts", ".jsx", ".tsx", ".css", ".scss", ".less",
+            ".html", ".htm", ".razor", ".cshtml", ".vbhtml",
+            ".sql", ".md", ".txt", ".yml", ".yaml", ".ps1", ".psm1",
+            ".go", ".rs", ".java", ".kt", ".swift", ".proto",
+        };
+
+        /// <summary>
+        /// 自动发现解决方案中的源代码文件。
+        /// 当用户没有指明具体文件时，ExploreAgent 负责扫描整个解决方案，
+        /// 收集所有项目源代码文件路径，供后续上下文构建使用。
+        /// </summary>
+        /// <param name="solutionPath">解决方案文件路径（.sln）。</param>
+        /// <param name="maxFiles">最多收集的文件数量，默认 200。</param>
+        /// <returns>发现的源代码文件路径列表。</returns>
+        public async Task<List<string>> DiscoverSolutionFilesAsync(
+            string solutionPath, int maxFiles = 200)
+        {
+            var discoveredFiles = new List<string>();
+
+            try
+            {
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var dte = (EnvDTE.DTE)Microsoft.VisualStudio.Shell.Package
+                    .GetGlobalService(typeof(EnvDTE.DTE));
+                if (dte?.Solution == null || !dte.Solution.IsOpen)
+                {
+                    AddLog("INFO", "[Discover] 当前没有打开的解决方案，跳过文件发现");
+                    return discoveredFiles;
+                }
+
+                string solutionDir = Path.GetDirectoryName(solutionPath) ?? string.Empty;
+                AddLog("INFO", $"[Discover] 开始扫描解决方案: {solutionPath}");
+
+                // 遍历解决方案中的所有项目
+                foreach (EnvDTE.Project project in dte.Solution.Projects)
+                {
+                    if (discoveredFiles.Count >= maxFiles) break;
+
+                    try
+                    {
+                        await CollectProjectFilesRecursiveAsync(
+                            project.ProjectItems, discoveredFiles, maxFiles);
+                    }
+                    catch (Exception ex)
+                    {
+                        AddLog("WARN", $"[Discover] 扫描项目 {project.Name} 时出错: {ex.Message}");
+                    }
+                }
+
+                AddLog("INFO", $"[Discover] 文件发现完成: {discoveredFiles.Count} 个文件");
+            }
+            catch (Exception ex)
+            {
+                AddLog("ERROR", $"[Discover] 文件发现失败: {ex.Message}");
+            }
+
+            return discoveredFiles;
+        }
+
+        /// <summary>
+        /// 递归遍历项目项，收集源代码文件路径。
+        /// </summary>
+        private async Task CollectProjectFilesRecursiveAsync(
+            EnvDTE.ProjectItems projectItems,
+            List<string> discoveredFiles,
+            int maxFiles)
+        {
+            if (projectItems == null || discoveredFiles.Count >= maxFiles)
+                return;
+
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+            foreach (EnvDTE.ProjectItem item in projectItems)
+            {
+                if (discoveredFiles.Count >= maxFiles) return;
+
+                try
+                {
+                    // 递归处理子文件夹
+                    if (item.ProjectItems != null && item.ProjectItems.Count > 0)
+                    {
+                        await CollectProjectFilesRecursiveAsync(
+                            item.ProjectItems, discoveredFiles, maxFiles);
+                    }
+
+                    // 获取文件路径
+                    string? filePath = null;
+                    try { filePath = item.FileNames[0]; } catch { }
+
+                    if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
+                    {
+                        string ext = Path.GetExtension(filePath);
+                        bool isSourceFile = SourceFileExtensions.Contains(ext);
+
+                        if (isSourceFile && !discoveredFiles.Contains(filePath, StringComparer.OrdinalIgnoreCase))
+                        {
+                            discoveredFiles.Add(filePath);
+                        }
+                    }
+                }
+                catch
+                {
+                    // 跳过无法访问的项
+                }
+            }
+        }
+
+        /// <summary>
+        /// 智能文件发现：根据用户查询模糊搜索代码库中的相关文件。
+        /// 
+        /// 三阶段搜索策略：
+        /// 1. 文件名匹配 — 提取查询关键词，匹配文件名
+        /// 2. 内容搜索   — grep 搜索源码文件中是否包含关键词
+        /// 3. 相关性排序 — 综合文件名和内容命中数加权排序
+        /// 
+        /// 适用场景：用户提出模糊需求（如"修改 UserService 类"、
+        /// "重构认证逻辑"）时，自动定位可能相关的文件。
+        /// </summary>
+        /// <param name="solutionPath">解决方案路径。</param>
+        /// <param name="userQuery">用户的原始问题/需求描述。</param>
+        /// <param name="maxFiles">最多返回的文件数量，默认 30。</param>
+        /// <returns>按相关性降序排列的文件路径列表。</returns>
+        public async Task<List<string>> DiscoverRelevantFilesAsync(
+            string solutionPath, string userQuery, int maxFiles = 30)
+        {
+            var relevantFiles = new List<string>();
+
+            if (string.IsNullOrWhiteSpace(userQuery))
+            {
+                // 无查询时回退到全量发现
+                return await DiscoverSolutionFilesAsync(solutionPath);
+            }
+
+            try
+            {
+                AddLog("INFO", $"[Discover] 智能文件发现开始: \"{userQuery.Truncate(100)}\"");
+
+                // ── 阶段 0: 提取搜索关键词 ──
+                var keywords = ExtractKeywordsFromQuery(userQuery);
+                if (keywords.Count == 0)
+                {
+                    return await DiscoverSolutionFilesAsync(solutionPath);
+                }
+
+                AddLog("INFO", $"[Discover] 提取关键词: [{string.Join(", ", keywords)}]");
+
+                // ── 阶段 1: 收集候选文件 ──
+                var candidateFiles = await DiscoverSolutionFilesAsync(solutionPath, maxFiles: 200);
+                if (candidateFiles.Count == 0)
+                {
+                    AddLog("INFO", "[Discover] 未找到候选文件");
+                    return relevantFiles;
+                }
+
+                // ── 阶段 2: 对每个候选文件评分 ──
+                var scoredFiles = new List<(string FilePath, int Score)>();
+
+                await Task.Run(() =>
+                {
+                    foreach (var filePath in candidateFiles)
+                    {
+                        string fileName = Path.GetFileName(filePath);
+                        int score = ScoreFileRelevance(filePath, fileName, keywords);
+                        if (score > 0)
+                        {
+                            scoredFiles.Add((filePath, score));
+                        }
+                    }
+                });
+
+                // ── 阶段 3: 按相关性降序排列，取前 maxFiles 个 ──
+                relevantFiles = scoredFiles
+                    .OrderByDescending(f => f.Score)
+                    .Take(maxFiles)
+                    .Select(f => f.FilePath)
+                    .ToList();
+
+                AddLog("INFO", $"[Discover] 智能文件发现完成: {relevantFiles.Count} 个相关文件 "
+                    + $"(候选: {candidateFiles.Count}, 评分>0: {scoredFiles.Count})");
+            }
+            catch (Exception ex)
+            {
+                AddLog("ERROR", $"[Discover] 智能文件发现失败: {ex.Message}");
+                // 回退到全量发现
+                relevantFiles = await DiscoverSolutionFilesAsync(solutionPath);
+            }
+
+            return relevantFiles;
+        }
+
+        /// <summary>
+        /// 从用户查询中提取有意义的搜索关键词。
+        /// 过滤常见停用词和中文语气词。
+        /// </summary>
+        private static HashSet<string> ExtractKeywordsFromQuery(string userQuery)
+        {
+            var keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 中文/英文停用词
+            var stopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "the", "a", "an", "is", "are", "was", "were", "be", "been",
+                "have", "has", "had", "do", "does", "did", "will", "would",
+                "can", "could", "should", "may", "might", "shall", "must",
+                "to", "of", "in", "for", "on", "with", "at", "by", "from",
+                "and", "or", "not", "but", "if", "then", "else", "when",
+                "this", "that", "these", "those", "it", "its", "my", "our",
+                "i", "you", "he", "she", "we", "they", "me", "him", "her",
+                "请", "帮我", "帮忙", "一下", "一个", "这个", "那个", "哪些",
+                "什么", "怎么", "如何", "为什么", "能不能", "可以", "需要",
+                "修改", "重构", "优化", "添加", "删除", "实现", "创建",
+                "代码", "文件", "功能", "逻辑", "需求", "问题",
+            };
+
+            // 按常见分隔符拆分
+            var tokens = userQuery.Split(
+                new[] { ' ', '\t', '\n', '\r', '，', '。', '！', '？', '、', '：', '；',
+                        '(', ')', '[', ']', '{', '}', '<', '>', '"', '\'', '`', '/', '\\' },
+                StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var token in tokens)
+            {
+                string cleaned = token.Trim().TrimEnd('.', ',', ':', ';', '!', '?');
+
+                // 跳过停用词、过短、纯数字、纯标点
+                if (cleaned.Length < 2) continue;
+                if (stopWords.Contains(cleaned)) continue;
+                if (cleaned.All(char.IsDigit)) continue;
+                if (cleaned.All(c => !char.IsLetterOrDigit(c))) continue;
+
+                // 驼峰/帕斯卡命名拆分：UserService → User, Service
+                if (cleaned.Length > 2 && char.IsUpper(cleaned[0]))
+                {
+                    keywords.Add(cleaned); // 保留原始形式
+
+                    // 拆分驼峰
+                    var parts = SplitCamelCase(cleaned);
+                    foreach (var part in parts)
+                    {
+                        if (part.Length >= 2 && !stopWords.Contains(part))
+                            keywords.Add(part);
+                    }
+                }
+                else
+                {
+                    keywords.Add(cleaned);
+                }
+            }
+
+            return keywords;
+        }
+
+        /// <summary>
+        /// 拆分驼峰/帕斯卡命名（如 "UserService" → {"User", "Service"}）。
+        /// </summary>
+        private static List<string> SplitCamelCase(string name)
+        {
+            var parts = new List<string>();
+            int start = 0;
+            for (int i = 1; i < name.Length; i++)
+            {
+                if (char.IsUpper(name[i]) && !char.IsUpper(name[i - 1]))
+                {
+                    parts.Add(name.Substring(start, i - start));
+                    start = i;
+                }
+            }
+            if (start < name.Length)
+                parts.Add(name.Substring(start));
+            return parts;
+        }
+
+        /// <summary>
+        /// 对单个文件计算与查询关键词的相关性得分。
+        /// 评分规则：
+        /// - 文件名完全匹配关键词: +10 分/词
+        /// - 文件名部分匹配关键词: +5 分/词
+        /// - 文件内容包含关键词: +3 分/行
+        /// - 内容命中行数越多分数越高（有上限）
+        /// </summary>
+        private static int ScoreFileRelevance(string filePath, string fileName, HashSet<string> keywords)
+        {
+            int score = 0;
+
+            // ── 文件名匹配 ──
+            string fileNameNoExt = Path.GetFileNameWithoutExtension(fileName);
+            foreach (var kw in keywords)
+            {
+                // 完全匹配文件名
+                if (fileNameNoExt.Equals(kw, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 10;
+                }
+                // 文件名包含关键词
+                else if (fileNameNoExt.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    score += 5;
+                }
+            }
+
+            // ── 文件内容搜索（grep） ──
+            try
+            {
+                // 只读取文本文件进行内容搜索
+                string ext = Path.GetExtension(filePath).ToLowerInvariant();
+                bool isTextFile = ext is ".cs" or ".vb" or ".cpp" or ".c" or ".h" or ".hpp"
+                    or ".fs" or ".fsx" or ".py" or ".js" or ".ts" or ".jsx" or ".tsx"
+                    or ".java" or ".go" or ".rs" or ".swift" or ".kt" or ".php"
+                    or ".xml" or ".json" or ".yaml" or ".yml" or ".md" or ".txt"
+                    or ".xaml" or ".csproj" or ".vbproj" or ".config" or ".sql"
+                    or ".css" or ".html" or ".htm" or ".razor" or ".cshtml";
+
+                if (!isTextFile) return score;
+
+                // 读取文件内容并在行级别搜索
+                var lines = File.ReadAllLines(filePath);
+                const int maxLineScore = 30; // 内容搜索最高30分
+                int lineHitCount = 0;
+
+                foreach (var line in lines)
+                {
+                    foreach (var kw in keywords)
+                    {
+                        if (line.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            lineHitCount++;
+                            break; // 每行最多计1次
+                        }
+                    }
+                }
+
+                score += Math.Min(lineHitCount * 3, maxLineScore);
+            }
+            catch
+            {
+                // 无法读取的文件跳过内容搜索
+            }
+
+            return score;
+        }
+
+        /// <summary>
+        /// 检测用户消息中是否引用了具体文件。
+        /// 如果用户消息中包含文件路径或文件名+扩展名模式，
+        /// 则认为用户已指明文件，无需自动附加解决方案全部代码。
+        /// </summary>
+        /// <param name="userText">用户输入的原始文本。</param>
+        /// <returns>true 表示用户已指明文件。</returns>
+        public static bool UserMessageReferencesFiles(string? userText)
+        {
+            if (string.IsNullOrWhiteSpace(userText))
+                return false;
+
+            // 模式 1: 包含常见源代码文件扩展名（如 .cs、.py 等）
+            var codeFilePattern = new Regex(
+                @"\.(cs|vb|cpp|c|h|hpp|fs|py|js|ts|jsx|tsx|java|go|rs|swift|kt|php|rb|lua|sql|xml|json|yaml|yml|md|css|html|xaml|csproj|vbproj|sln|config|razor|cshtml)\b",
+                RegexOptions.IgnoreCase);
+            if (codeFilePattern.IsMatch(userText))
+                return true;
+
+            // 模式 2: 包含 Windows 绝对路径（盘符 + 反斜杠）
+            if (Regex.IsMatch(userText, @"[A-Za-z]:\\"))
+                return true;
+
+            // 模式 3: 包含 Unix 绝对路径或相对路径模式
+            if (Regex.IsMatch(userText, @"(?:^|\s)[./~].*[/\\]"))
+                return true;
+
+            // 模式 4: 包含文件名+扩展名组合（如 "Program.cs"、"app.py"）
+            var fileNamePattern = new Regex(
+                @"\b\w+\.(cs|vb|cpp|c|h|hpp|fs|py|js|ts|jsx|tsx|java|go|rs|swift|kt|php|rb|lua|sql|xml|json|yaml|yml|md|css|html|xaml)\b",
+                RegexOptions.IgnoreCase);
+            if (fileNamePattern.IsMatch(userText))
+                return true;
+
+            return false;
         }
 
         #endregion

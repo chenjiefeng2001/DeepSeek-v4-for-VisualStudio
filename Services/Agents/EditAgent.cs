@@ -1,4 +1,4 @@
-using DeepSeek_v4_for_VisualStudio.Models;
+﻿using DeepSeek_v4_for_VisualStudio.Models;
 using DeepSeek_v4_for_VisualStudio.ToolWindows;
 using DeepSeek_v4_for_VisualStudio.Utils;
 using System;
@@ -24,6 +24,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
     public class EditAgent : BaseAgent
     {
         private CancellationTokenSource? _agentCts;
+
+        /// <summary>
+        /// ExploreAgent 引用，由 AgentDispatcher 注入。
+        /// 用于在执行代码修改前智能发现相关文件。
+        /// </summary>
+        public ExploreAgent? ExploreAgent { get; set; }
 
         /// <summary>当前正在执行的任务计划</summary>
         public AgentTaskPlan? CurrentPlan { get; set; }
@@ -113,7 +119,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 await ExecutePlanAsync(context.ActivePlan, context);
                 result.Plan = context.ActivePlan;
                 result.FileChanges = context.ActivePlan.ChangedFiles;
-                result.Content = BuildSummaryMarkdown(context.ActivePlan);
+                string aiSummary = await GenerateChangeSummaryAsync(context.ActivePlan, context.CancellationToken);
+                result.Content = BuildSummaryMarkdown(context.ActivePlan, aiSummary);
             }
             else
             {
@@ -123,7 +130,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 await ExecutePlanAsync(plan, context);
                 result.Plan = plan;
                 result.FileChanges = plan.ChangedFiles;
-                result.Content = BuildSummaryMarkdown(plan);
+                string aiSummary = await GenerateChangeSummaryAsync(plan, context.CancellationToken);
+                result.Content = BuildSummaryMarkdown(plan, aiSummary);
             }
 
             result.Logs.AddRange(_logs);
@@ -255,8 +263,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             string result = string.Empty;
             List<FileChangeSummary> changes = new();
 
-            // ── 收集项目文件上下文（帮助 AI 理解现有代码架构和风格）──
-            string projectContext = await GatherProjectFilesContextAsync(context.SolutionPath);
+            // ── 收集项目文件上下文：委托 ExploreAgent 智能发现相关文件 ──
+            string projectContext = await GatherProjectFilesContextAsync(
+                context.SolutionPath, step.Description);
             string enrichedPrompt = stepPrompt;
             if (!string.IsNullOrEmpty(projectContext))
             {
@@ -287,6 +296,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             step.AiResponse = result;
             changes = ParseCodeChangesFromResult(result);
 
+            // ── 保存原始文件内容（用于最终 diff 比较）──
+            var originalContents = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            // ── 全局抑制 diff 预览，流程结束时统一显示一次 ──
+            TerminalWindowHelper.SuppressDiffPreview = true;
+
             // ── 应用代码变更 ──
             foreach (var change in changes)
             {
@@ -295,6 +310,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 {
                     string resolvedPath = ResolveFilePath(change.FilePath, context.SolutionPath);
                     change.FilePath = resolvedPath;
+
+                    // 保存原始内容（用于最终 diff）
+                    if (!originalContents.ContainsKey(resolvedPath))
+                    {
+                        originalContents[resolvedPath] = File.Exists(resolvedPath)
+                            ? await Task.Run(() => File.ReadAllText(resolvedPath), ct)
+                            : string.Empty;
+                    }
 
                     // ── 新文件：先建空文件 → 加入项目 → 再写内容 ──
                     // 这样 WriteCodeToFileAsync 的 VS SDK 路径才能正常工作
@@ -320,10 +343,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     {
                         AddLog("INFO", $"✅ 已写入: {resolvedPath} (+{change.LinesAdded} -{change.LinesRemoved})");
                         plan.ChangedFiles.Add(change);
-
-                        // 已有文件：确认已在项目中（新文件已在上方加入）
-                        if (!isNewFile)
-                            await AddFileToProjectAsync(resolvedPath, ct);
                     }
                     else
                     {
@@ -344,6 +363,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             if (changes.Count > 0 && !ct.IsCancellationRequested)
             {
                 await BuildAndFixLoopAsync(step, plan, context, changes, ct);
+            }
+
+            // ── 恢复 diff 预览，统一显示一次最终 diff ──
+            TerminalWindowHelper.SuppressDiffPreview = false;
+
+            foreach (var kvp in originalContents)
+            {
+                string finalContent = File.Exists(kvp.Key)
+                    ? await Task.Run(() => File.ReadAllText(kvp.Key), ct)
+                    : string.Empty;
+                if (kvp.Value != finalContent)
+                {
+                    await TerminalWindowHelper.ShowFinalDiffAsync(kvp.Value, finalContent, kvp.Key);
+                }
             }
         }
 
@@ -394,18 +427,160 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     firstProject?.UniqueName ?? "", WaitForBuildToFinish: true);
 
                 int errors = sb.LastBuildInfo;
-                string result = errors == 0
-                    ? "✅ 构建成功，0 个错误"
-                    : $"⚠️ 构建完成，{errors} 个错误";
 
-                Logger.Info($"[EditAgent] {result}");
-                return result;
+                // ── 收集编译错误详情 ──
+                string errorDetails = CollectBuildErrors(dte);
+
+                if (errors == 0)
+                {
+                    Logger.Info("[EditAgent] ✅ 构建成功，0 个错误");
+                    return "✅ 构建成功，0 个错误";
+                }
+
+                var result = new StringBuilder();
+                result.AppendLine($"⚠️ 构建完成，{errors} 个错误");
+                if (!string.IsNullOrEmpty(errorDetails))
+                {
+                    result.AppendLine();
+                    result.AppendLine("## 编译错误详情");
+                    result.Append(errorDetails);
+                }
+
+                string fullResult = result.ToString();
+                Logger.Info($"[EditAgent] {fullResult.Truncate(500)}");
+                return fullResult;
             }
             catch (Exception ex)
             {
                 Logger.Warn($"[EditAgent] 构建异常: {ex.Message}");
                 return $"⚠️ 构建失败: {ex.Message}";
             }
+        }
+
+        /// <summary>
+        /// 从 VS Error List 和 Output 窗口收集编译错误详情。
+        /// 按文件分组，每个错误包含文件名、行号、错误描述。
+        /// </summary>
+        private static string CollectBuildErrors(EnvDTE.DTE dte)
+        {
+            var sb = new StringBuilder();
+
+            // ToolWindows 需要 DTE2 接口（EnvDTE80）
+            var dte2 = dte as EnvDTE80.DTE2;
+            if (dte2 == null) return sb.ToString();
+
+            try
+            {
+                // ── 方案一：Error List 窗口 ──
+                var errorList = dte2.ToolWindows.ErrorList;
+                if (errorList != null)
+                {
+                    var errorItems = errorList.ErrorItems;
+                    if (errorItems != null && errorItems.Count > 0)
+                    {
+                        // 按文件分组
+                        var errorsByFile = new Dictionary<string, List<string>>(
+                            StringComparer.OrdinalIgnoreCase);
+
+                        for (int i = 1; i <= errorItems.Count; i++)
+                        {
+                            try
+                            {
+                                var item = errorItems.Item(i);
+                                // 只收集错误（跳过警告）
+                                if (item.ErrorLevel != EnvDTE80.vsBuildErrorLevel.vsBuildErrorLevelHigh)
+                                    continue;
+
+                                string fullPath = item.FileName ?? "(未知文件)";
+                                // 作为 heading 使用完整路径，以便后续能定位并读取文件内容
+                                // 如果 AI 修改了 a.cpp 但错误指向 b.h，AI 需要能看到 b.h 的内容来修复
+                                string headingKey = !string.IsNullOrEmpty(fullPath) && fullPath != "(未知文件)"
+                                    ? fullPath
+                                    : "(未知文件)";
+
+                                string desc = $"- **行 {item.Line}**: {item.Description}";
+
+                                if (!errorsByFile.ContainsKey(headingKey))
+                                    errorsByFile[headingKey] = new List<string>();
+                                errorsByFile[headingKey].Add(desc);
+                            }
+                            catch
+                            {
+                                // 跳过无法读取的错误项
+                            }
+                        }
+
+                        if (errorsByFile.Count > 0)
+                        {
+                            foreach (var kvp in errorsByFile)
+                            {
+                                sb.AppendLine($"### {kvp.Key}");
+                                foreach (var desc in kvp.Value)
+                                    sb.AppendLine(desc);
+                                sb.AppendLine();
+                            }
+
+                            Logger.Info($"[BuildErrors] 从 Error List 收集到 {errorsByFile.Sum(k => k.Value.Count)} 个错误，"
+                                + $"涉及 {errorsByFile.Count} 个文件");
+                            return sb.ToString();
+                        }
+                    }
+                }
+
+                // ── 方案二：Output 窗口（回退） ──
+                try
+                {
+                    var outputWindow = dte2.ToolWindows.OutputWindow;
+                    var buildPane = outputWindow?.OutputWindowPanes
+                        ?.Cast<EnvDTE.OutputWindowPane>()
+                        ?.FirstOrDefault(p => p.Name.IndexOf("Build", StringComparison.OrdinalIgnoreCase) >= 0
+                                           || p.Name.IndexOf("生成", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                    if (buildPane != null)
+                    {
+                        var textDoc = buildPane.TextDocument;
+                        if (textDoc != null)
+                        {
+                            var sel = textDoc.Selection;
+                            sel.SelectAll();
+                            string buildOutput = sel.Text ?? string.Empty;
+                            if (!string.IsNullOrWhiteSpace(buildOutput))
+                            {
+                                // 提取错误行（MSBuild 格式：file(line): error CODE: message）
+                                var errorLines = buildOutput
+                                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                    .Where(line => line.Contains("error", StringComparison.OrdinalIgnoreCase)
+                                                && !line.Contains("0 Error", StringComparison.OrdinalIgnoreCase)
+                                                && !line.Contains("0 错误", StringComparison.OrdinalIgnoreCase))
+                                    .Take(30) // 最多取30行
+                                    .Select(line => line.Trim())
+                                    .ToList();
+
+                                if (errorLines.Count > 0)
+                                {
+                                    sb.AppendLine("### 构建输出 (Output Window)");
+                                    foreach (var line in errorLines)
+                                        sb.AppendLine($"- {line}");
+                                    sb.AppendLine();
+
+                                    Logger.Info($"[BuildErrors] 从 Output 窗口收集到 {errorLines.Count} 行错误信息");
+                                    return sb.ToString();
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"[BuildErrors] Output 窗口读取失败: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[BuildErrors] Error List 收集失败: {ex.Message}");
+            }
+
+            return sb.ToString();
         }
 
         #endregion
@@ -523,7 +698,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             try { PlanUpdated?.Invoke(CurrentPlan!); } catch { }
         }
 
-        private static string BuildSummaryMarkdown(AgentTaskPlan plan)
+        private static string BuildSummaryMarkdown(AgentTaskPlan plan, string? aiSummary = null)
         {
             if (plan.IsCancelled)
                 return "⚠️ **任务已取消**";
@@ -535,8 +710,19 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             sb.AppendLine($"**修改文件数**: {plan.ChangedFiles.Count}");
             sb.AppendLine();
 
+            // ── AI 生成的文字总结 ──
+            if (!string.IsNullOrWhiteSpace(aiSummary))
+            {
+                sb.AppendLine("### 📝 变更摘要");
+                sb.AppendLine();
+                sb.AppendLine(aiSummary);
+                sb.AppendLine();
+            }
+
             if (plan.ChangedFiles.Count > 0)
             {
+                sb.AppendLine("### 📊 文件变更统计");
+                sb.AppendLine();
                 sb.AppendLine("| 文件 | 变更 |");
                 sb.AppendLine("|------|------|");
                 foreach (var change in plan.ChangedFiles)
@@ -553,58 +739,105 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             return sb.ToString();
         }
 
+        /// <summary>
+        /// 生成 AI 文字总结，概括本次代码变更的内容和目的。
+        /// 用轻量级 prompt 快速产出自然语言摘要。
+        /// </summary>
+        private async Task<string> GenerateChangeSummaryAsync(AgentTaskPlan plan, CancellationToken ct)
+        {
+            if (plan.ChangedFiles.Count == 0) return string.Empty;
+
+            try
+            {
+                var summaryPrompt = new StringBuilder();
+                summaryPrompt.AppendLine("你是一个代码审查助手。请用2-3句简洁的中文总结以下代码变更。");
+                summaryPrompt.AppendLine("只描述做了什么、为什么做、影响范围。不要评价代码质量。");
+                summaryPrompt.AppendLine();
+                summaryPrompt.AppendLine($"## 任务: {plan.Title}");
+                summaryPrompt.AppendLine();
+                summaryPrompt.AppendLine("## 修改的文件");
+                foreach (var change in plan.ChangedFiles)
+                {
+                    string fileName = Path.GetFileName(change.FilePath);
+                    summaryPrompt.AppendLine($"- **{fileName}** (+{change.LinesAdded} -{change.LinesRemoved})");
+                }
+                summaryPrompt.AppendLine();
+                summaryPrompt.AppendLine("## 步骤执行情况");
+                foreach (var step in plan.Steps)
+                {
+                    string status = step.Status switch
+                    {
+                        AgentStepStatus.Completed => "✅",
+                        AgentStepStatus.Failed => "❌",
+                        AgentStepStatus.Skipped => "⏭",
+                        _ => "⬜",
+                    };
+                    summaryPrompt.AppendLine($"- {status} {step.Title}: {step.ResultSummary.Truncate(100)}");
+                }
+                summaryPrompt.AppendLine();
+                summaryPrompt.AppendLine("请用中文输出简短的变更摘要（2-3句）：");
+
+                string result = await CallAiShortAsync(
+                    "你只输出中文摘要，不输出任何其他内容。",
+                    summaryPrompt.ToString(), ct, maxTokens: 256);
+
+                return result?.Trim() ?? string.Empty;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[EditAgent] 生成变更摘要失败: {ex.Message}");
+                return string.Empty;
+            }
+        }
+
         #endregion
 
         #region Project Integration Helpers
 
         /// <summary>
-        /// 收集项目文件上下文 — 读取解决方案下的所有源代码文件内容，
-        /// 为 AI 提供完整的项目结构和代码风格参考。
+        /// 收集项目文件上下文 — 委托 ExploreAgent 智能发现与当前步骤相关的文件，
+        /// 而非盲目读取所有文件。提供完整的项目结构和代码风格参考给 AI。
         /// 限制总大小防止超出 token 限制。
         /// </summary>
-        private static async Task<string> GatherProjectFilesContextAsync(string? solutionPath)
+        private async Task<string> GatherProjectFilesContextAsync(
+            string? solutionPath, string userQuery)
         {
-            if (string.IsNullOrEmpty(solutionPath) || !Directory.Exists(solutionPath))
+            if (string.IsNullOrEmpty(solutionPath))
                 return string.Empty;
 
-            const int maxTotalChars = 60000; // 总字符数上限，防止超出 token 限制
+            const int maxTotalChars = 60000;
             var sb = new StringBuilder();
             int totalChars = 0;
 
             try
             {
-                // 常见源代码文件扩展名
-                var codeExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                List<string> relevantFiles;
+
+                // ── 优先使用 ExploreAgent 智能发现相关文件 ──
+                if (ExploreAgent != null && !string.IsNullOrWhiteSpace(userQuery))
                 {
-                    ".cs", ".vb", ".cpp", ".h", ".hpp", ".c", ".cc", ".cxx",
-                    ".xaml", ".xml", ".config", ".csproj", ".vbproj", ".vcxproj",
-                    ".json", ".ts", ".js", ".py", ".java", ".fs", ".fsx",
-                    ".sln", ".targets", ".props", ".md", ".txt",
-                };
-
-                // 排除目录
-                var excludeDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    AddLog("INFO", $"[EditAgent] 委托 ExploreAgent 智能发现相关文件: \"{userQuery.Truncate(80)}\"");
+                    relevantFiles = await ExploreAgent.DiscoverRelevantFilesAsync(
+                        solutionPath, userQuery, maxFiles: 30);
+                    AddLog("INFO", $"[EditAgent] ExploreAgent 返回 {relevantFiles.Count} 个相关文件");
+                }
+                else
                 {
-                    "bin", "obj", ".git", ".vs", "node_modules", "packages",
-                    "Debug", "Release", ".vscode", ".idea",
-                };
+                    // ── 回退：使用 ExploreAgent 全量发现 ──
+                    if (ExploreAgent != null)
+                    {
+                        relevantFiles = await ExploreAgent.DiscoverSolutionFilesAsync(
+                            solutionPath, maxFiles: 50);
+                    }
+                    else
+                    {
+                        // ── 最终回退：简单的目录扫描 ──
+                        relevantFiles = await FallbackFileScanAsync(solutionPath);
+                    }
+                }
 
-                var files = await Task.Run(() =>
-                    Directory.GetFiles(solutionPath, "*.*", SearchOption.AllDirectories)
-                        .Where(f =>
-                        {
-                            string dir = Path.GetDirectoryName(f) ?? "";
-                            string ext = Path.GetExtension(f);
-                            // 跳过排除目录
-                            foreach (var excludeDir in excludeDirs)
-                                if (dir.IndexOf(excludeDir, StringComparison.OrdinalIgnoreCase) >= 0)
-                                    return false;
-                            return codeExtensions.Contains(ext);
-                        })
-                        .Take(80) // 最多读取80个文件
-                        .ToList());
-
-                foreach (var file in files)
+                // ── 读取发现的文件内容 ──
+                foreach (var file in relevantFiles)
                 {
                     if (totalChars >= maxTotalChars) break;
 
@@ -614,7 +847,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         string content = await Task.Run(() => File.ReadAllText(file));
                         int remainingChars = maxTotalChars - totalChars;
                         if (content.Length > remainingChars)
-                            content = content.Substring(0, remainingChars) + "\n// ... (文件过长，已截断)";
+                            content = content.Substring(0, remainingChars)
+                                + "\n// ... (文件过长，已截断)";
 
                         sb.AppendLine($"### {relativePath}");
                         sb.AppendLine("```");
@@ -630,14 +864,59 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     }
                 }
 
-                Logger.Info($"[EditAgent] 项目文件上下文: {files.Count} 个文件, {totalChars} 字符");
+                AddLog("INFO", $"[EditAgent] 项目文件上下文: {relevantFiles.Count} 个文件, {totalChars} 字符");
             }
             catch (Exception ex)
             {
-                Logger.Warn($"[EditAgent] 收集项目文件上下文失败: {ex.Message}");
+                AddLog("WARN", $"[EditAgent] 收集项目文件上下文失败: {ex.Message}");
             }
 
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// 最终回退方案：简单的目录文件扫描（当 ExploreAgent 不可用时）。
+        /// </summary>
+        private static async Task<List<string>> FallbackFileScanAsync(string solutionPath)
+        {
+            var files = new List<string>();
+
+            try
+            {
+                var codeExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ".cs", ".vb", ".cpp", ".h", ".hpp", ".c",
+                    ".xaml", ".xml", ".config", ".csproj", ".vbproj",
+                    ".json", ".ts", ".js", ".py", ".java", ".fs", ".fsx",
+                    ".sln", ".md",
+                };
+
+                var excludeDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "bin", "obj", ".git", ".vs", "node_modules", "packages",
+                    "Debug", "Release",
+                };
+
+                files = await Task.Run(() =>
+                    Directory.GetFiles(solutionPath, "*.*", SearchOption.AllDirectories)
+                        .Where(f =>
+                        {
+                            string dir = Path.GetDirectoryName(f) ?? "";
+                            string ext = Path.GetExtension(f);
+                            foreach (var excludeDir in excludeDirs)
+                                if (dir.IndexOf(excludeDir, StringComparison.OrdinalIgnoreCase) >= 0)
+                                    return false;
+                            return codeExtensions.Contains(ext);
+                        })
+                        .Take(50)
+                        .ToList());
+            }
+            catch
+            {
+                // 忽略扫描失败
+            }
+
+            return files;
         }
 
         /// <summary>
@@ -737,7 +1016,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 string buildResult = await ExecuteBuildStepAsync(
                     new AgentStep { Title = "编译验证" }, context.SolutionPath, ct);
 
-                AddLog("INFO", $"[编译 第{round}轮] {buildResult}");
+                // 只记录一行摘要到 UI 日志（错误详情已在 ExecuteBuildStepAsync 内部记录）
+                string oneLineSummary = buildResult.Split(new[] { '\r', '\n' },
+                    StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? buildResult;
+                AddLog("INFO", $"[编译 第{round}轮] {oneLineSummary}");
 
                 // 构建成功 → 结束
                 if (buildResult.Contains("✅") || buildResult.Contains("0 个错误"))
@@ -763,17 +1045,25 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 fixPrompt.AppendLine();
                 fixPrompt.AppendLine($"构建结果: {buildResult}");
                 fixPrompt.AppendLine();
-                fixPrompt.AppendLine("## 已修改的文件");
+                fixPrompt.AppendLine("## 已修改的文件及其当前内容");
                 foreach (var change in appliedChanges)
                 {
-                    fixPrompt.AppendLine($"- `{change.FilePath}`");
+                    fixPrompt.AppendLine($"### `{change.FilePath}`");
+                    fixPrompt.AppendLine();
+                    AppendFileContent(fixPrompt, change.FilePath);
+                    fixPrompt.AppendLine();
                 }
-                fixPrompt.AppendLine();
+
+                // ── 错误可能指向非修改文件（如 AI 改了 a.cpp 但编译错误在 b.h） ──
+                // 解析 buildResult 中的文件路径，读取这些"牵连文件"的内容
+                AppendErrorReferencedFiles(fixPrompt, buildResult, appliedChanges, context.SolutionPath);
+
                 fixPrompt.AppendLine("## 要求");
-                fixPrompt.AppendLine("1. 分析编译错误的原因");
+                fixPrompt.AppendLine("1. 仔细阅读上面的编译错误详情，理解每个错误的根本原因");
                 fixPrompt.AppendLine("2. 使用 ```file: 格式输出修复后的完整文件内容");
-                fixPrompt.AppendLine("3. 只修改有问题的文件，不要修改其他文件");
-                fixPrompt.AppendLine("4. 确保修复后代码语法正确，类型匹配，引用完整");
+                fixPrompt.AppendLine("3. 只修改有编译错误的文件，不要修改其他文件");
+                fixPrompt.AppendLine("4. 确保修复后代码语法正确，类型匹配，引用完整，无未定义标识符");
+                fixPrompt.AppendLine("5. 如果涉及头文件缺失或命名空间问题，请添加正确的 #include 或 using 声明");
 
                 string fixResult = await CallAiLongAsync(
                     Definition.SystemPrompt, fixPrompt.ToString(), ct, maxTokens: 8192);
@@ -817,6 +1107,106 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         AddLog("ERROR", $"修复写入异常: {ex.Message}");
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// 将文件内容以带语法高亮的代码块形式附加到 prompt。
+        /// </summary>
+        private static void AppendFileContent(StringBuilder sb, string filePath)
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    string fileContent = File.ReadAllText(filePath);
+                    string lang = Path.GetExtension(filePath).TrimStart('.').ToLowerInvariant();
+                    sb.AppendLine($"```{lang}");
+                    sb.AppendLine(fileContent);
+                    sb.AppendLine("```");
+                }
+                else
+                {
+                    sb.AppendLine("_(文件不存在)_");
+                }
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine($"_无法读取文件: {ex.Message}_");
+            }
+        }
+
+        /// <summary>
+        /// 从构建结果中提取错误涉及的文件路径，读取这些"牵连文件"的内容并附加到 prompt。
+        /// 
+        /// 场景：AI 修改了 a.cpp，但编译错误指向 b.h（被 a.cpp 包含的头文件）。
+        /// 如果不提供 b.h 的内容，AI 无法有效修复错误。
+        /// </summary>
+        private static void AppendErrorReferencedFiles(
+            StringBuilder fixPrompt,
+            string buildResult,
+            List<FileChangeSummary> appliedChanges,
+            string? solutionPath)
+        {
+            if (string.IsNullOrEmpty(buildResult)) return;
+
+            // ── 从 markdown 标题 `### F:\path\to\file` 和 `### `filepath`` 中提取文件路径 ──
+            var referencedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 匹配 `### C:\...` 或 `### /path/...` 格式（绝对路径）
+            foreach (System.Text.RegularExpressions.Match m in
+                System.Text.RegularExpressions.Regex.Matches(buildResult,
+                    @"###\s+(?:`?)([A-Za-z]:[^\r\n`]+)"))
+            {
+                string path = m.Groups[1].Value.Trim();
+                if (path.Length > 3 && path.IndexOfAny(new[] { '\\', '/' }) >= 0)
+                    referencedPaths.Add(path);
+            }
+
+            // 从 Output Window 回退格式中匹配路径：`- file(line): error ...`
+            foreach (System.Text.RegularExpressions.Match m in
+                System.Text.RegularExpressions.Regex.Matches(buildResult,
+                    @"-\s+([A-Za-z]:[^(]+\.[a-zA-Z]+)\s*\("))
+            {
+                string path = m.Groups[1].Value.Trim();
+                if (File.Exists(path))
+                    referencedPaths.Add(path);
+            }
+
+            if (referencedPaths.Count == 0) return;
+
+            // ── 过滤：只保留不在 appliedChanges 中的文件 ──
+            var alreadyCovered = new HashSet<string>(
+                appliedChanges.Select(c => c.FilePath),
+                StringComparer.OrdinalIgnoreCase);
+
+            var missingPaths = referencedPaths
+                .Where(p => !alreadyCovered.Contains(p))
+                .Take(5) // 最多额外读取 5 个牵连文件
+                .ToList();
+
+            if (missingPaths.Count == 0) return;
+
+            fixPrompt.AppendLine("## 编译错误涉及的其他文件（非本轮修改，但错误指向它们）");
+            fixPrompt.AppendLine();
+
+            foreach (var path in missingPaths)
+            {
+                fixPrompt.AppendLine($"### `{path}`");
+                fixPrompt.AppendLine();
+                AppendFileContent(fixPrompt, path);
+                fixPrompt.AppendLine();
+            }
+
+            // ── 也加入 appliedChanges 追踪，防止后续重复读取 ──
+            foreach (var path in missingPaths)
+            {
+                appliedChanges.Add(new FileChangeSummary
+                {
+                    FilePath = path,
+                    LinesAdded = 0,
+                    LinesRemoved = 0,
+                });
             }
         }
 

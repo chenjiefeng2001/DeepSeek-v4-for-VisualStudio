@@ -1,4 +1,5 @@
 using DeepSeek_v4_for_VisualStudio.Models;
+using DeepSeek_v4_for_VisualStudio.Services;
 using DeepSeek_v4_for_VisualStudio.Utils;
 using System;
 using System.Collections.Generic;
@@ -106,6 +107,22 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         {
             var sb = new StringBuilder();
             await foreach (var chunk in _apiService.ChatStreamAsync(history, null, ct))
+            {
+                if (!chunk.StartsWith("[THINKING]") && !chunk.StartsWith("[TOOL_CALL]"))
+                    sb.Append(chunk);
+            }
+            return sb.ToString().Trim();
+        }
+
+        /// <summary>
+        /// 使用 ConversationContextManager 构建的消息列表调用 AI。
+        /// 正确处理 reasoning_content 回传规则。
+        /// </summary>
+        protected async Task<string> CallAiWithContextAsync(ConversationContextManager ctxManager, CancellationToken ct, int maxTokens = 4096)
+        {
+            var messages = ctxManager.BuildApiMessages();
+            var sb = new StringBuilder();
+            await foreach (var chunk in _apiService.ChatStreamAsync(messages, null, ct))
             {
                 if (!chunk.StartsWith("[THINKING]") && !chunk.StartsWith("[TOOL_CALL]"))
                     sb.Append(chunk);

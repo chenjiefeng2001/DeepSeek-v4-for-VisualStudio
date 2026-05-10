@@ -44,6 +44,9 @@ namespace DeepSeek_v4_for_VisualStudio
         {
             await base.InitializeAsync(cancellationToken, progress);
 
+            // 设置全局 Options 实例，供静态工具类读取设置
+            DeepSeekOptionsPage.Instance = Options;
+
             // 注册菜单命令（视图 → 其他窗口 → DeepSeek Chat）
             await ShowChatWindowCommand.InitializeAsync(this);
 

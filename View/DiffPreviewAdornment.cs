@@ -10,7 +10,8 @@ using System.Windows.Media;
 namespace DeepSeek_v4_for_VisualStudio.View
 {
     /// <summary>
-    /// Diff 预览装饰器。在编辑器视口顶部显示「确认变更」和「撤销」按钮，
+    /// Diff 预览装饰器（方案三：适配 VS SDK 原生差异查看器）。
+    /// 在编辑器视口顶部显示「确认变更」和「撤销」按钮，
     /// 以及变更统计信息。仅当 <see cref="EditorDiffMarkerService"/> 中有活跃会话时显示。
     /// </summary>
     internal sealed class DiffPreviewAdornment
@@ -19,29 +20,20 @@ namespace DeepSeek_v4_for_VisualStudio.View
         private readonly IAdornmentLayer _adornmentLayer;
         private UIElement? _toolbar;
 
-        /// <summary>
-        /// 装饰层名称标识符。
-        /// </summary>
         public const string AdornmentLayerName = "DeepSeekDiffPreviewAdornment";
 
         #region Constructors
 
-        /// <summary>
-        /// 初始化装饰器，挂载到指定文本视图。
-        /// 仅当 <see cref="EditorDiffMarkerService"/> 中有活跃会话时显示 UI。
-        /// </summary>
         public DiffPreviewAdornment(IWpfTextView view)
         {
             _view = view ?? throw new ArgumentNullException(nameof(view));
             _adornmentLayer = view.GetAdornmentLayer(AdornmentLayerName);
 
-            // 监听布局变更，刷新装饰器位置
             _view.LayoutChanged += OnLayoutChanged;
 
-            // 监听 diff 服务状态变更
-            EditorDiffMarkerService.Instance.PreviewStateChanged += OnPreviewStateChanged;
+            // 方案三：不再监听 PreviewStateChanged（差异着色由 DiffViewerWindow 原生处理）
+            // 装饰器仅检查 IsPreviewActive 来决定是否显示确认/撤销按钮
 
-            // 初始刷新
             RefreshAdornment();
         }
 
@@ -54,40 +46,23 @@ namespace DeepSeek_v4_for_VisualStudio.View
             RefreshAdornment();
         }
 
-        private void OnPreviewStateChanged(ITextBuffer buffer)
-        {
-            // 仅处理关联视图的 buffer
-            if (buffer == _view.TextBuffer)
-            {
-                RefreshAdornment();
-            }
-        }
-
         #endregion
 
         #region Adornment Management
 
-        /// <summary>
-        /// 根据当前 diff 会话状态刷新装饰器 UI。
-        /// 有活跃会话 → 显示工具栏；无活跃会话 → 移除工具栏。
-        /// </summary>
         private void RefreshAdornment()
         {
             _adornmentLayer.RemoveAllAdornments();
 
-            var session = EditorDiffMarkerService.Instance.GetActiveSession(_view.TextBuffer);
-            if (session == null || !session.IsActive)
+            bool isActive = EditorDiffMarkerService.Instance.IsPreviewActive(_view.TextBuffer);
+            if (!isActive)
             {
                 _toolbar = null;
                 return;
             }
 
-            int addedCount = session.AddedLineSpans.Count;
-            int deletedCount = session.InsertedDeletedLines.Count;
+            _toolbar = CreateToolbar();
 
-            _toolbar = CreateToolbar(addedCount, deletedCount);
-
-            // ── 将工具栏固定在视口左上角 ──
             Canvas.SetLeft(_toolbar, 8);
             Canvas.SetTop(_toolbar, 6);
 
@@ -96,10 +71,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 null, null, _toolbar, null);
         }
 
-        /// <summary>
-        /// 创建包含「确认」和「撤销」按钮的浮动工具栏。
-        /// </summary>
-        private UIElement CreateToolbar(int addedCount, int deletedCount)
+        private UIElement CreateToolbar()
         {
             var container = new Border
             {
@@ -116,10 +88,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 Orientation = Orientation.Horizontal,
             };
 
-            // 变更统计
             var statsText = new TextBlock
             {
-                Text = $"+{addedCount} 行新增  -{deletedCount} 行删除",
+                Text = "📊 差异预览中（方案三：VS SDK 原生查看器）",
                 Foreground = new SolidColorBrush(Color.FromRgb(0xA0, 0xA0, 0xA0)),
                 FontSize = 12,
                 VerticalAlignment = VerticalAlignment.Center,
@@ -127,7 +98,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
             };
             stackPanel.Children.Add(statsText);
 
-            // 确认按钮
             var confirmBtn = CreateButton(
                 "✅ 确认变更",
                 Color.FromRgb(0x1B, 0x5E, 0x20),
@@ -139,11 +109,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 });
             stackPanel.Children.Add(confirmBtn);
 
-            // 分隔间距
             var spacer = new TextBlock { Width = 10 };
             stackPanel.Children.Add(spacer);
 
-            // 撤销按钮
             var undoBtn = CreateButton(
                 "↩️ 撤销",
                 Color.FromRgb(0x8B, 0x2E, 0x2E),
@@ -159,9 +127,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
             return container;
         }
 
-        /// <summary>
-        /// 创建统一样式的按钮。
-        /// </summary>
         private static Button CreateButton(string text, Color bgColor, Color borderColor, Action onClick)
         {
             var btn = new Button

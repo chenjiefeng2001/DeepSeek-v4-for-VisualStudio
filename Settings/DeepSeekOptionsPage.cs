@@ -19,6 +19,11 @@ namespace DeepSeek_v4_for_VisualStudio.Settings
         public static event Action? SettingsChanged;
 
         /// <summary>
+        /// 全局实例引用，在 Package 初始化时设置，方便静态工具类读取设置。
+        /// </summary>
+        public static DeepSeekOptionsPage? Instance { get; set; }
+
+        /// <summary>
         /// VS 在用户应用设置更改时调用此方法。
         /// 我们在此触发 SettingsChanged 事件以通知订阅者刷新配置。
         /// </summary>

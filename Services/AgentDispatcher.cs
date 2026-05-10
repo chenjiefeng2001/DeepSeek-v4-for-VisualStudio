@@ -94,18 +94,22 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 _ => AskAgent,
             };
 
+            // ── 注入 ExploreAgent 到 EditAgent，使其能智能发现相关文件 ──
+            // ── EditAgent 特殊处理：PlanUpdated 事件 ──
+            if (agent is EditAgent editAgent)
+            {
+                if (editAgent.ExploreAgent == null)
+                    editAgent.ExploreAgent = ExploreAgent;
+
+                editAgent.PlanUpdated -= OnEditAgentPlanUpdated;
+                editAgent.PlanUpdated += OnEditAgentPlanUpdated;
+            }
+
             // 绑定事件（如果尚未绑定）
             agent.PermissionRequested -= OnAgentPermissionRequested;
             agent.PermissionRequested += OnAgentPermissionRequested;
             agent.LogEntryAdded -= OnAgentLogEntryAdded;
             agent.LogEntryAdded += OnAgentLogEntryAdded;
-
-            // EditAgent 特殊处理：PlanUpdated 事件
-            if (agent is EditAgent editAgent)
-            {
-                editAgent.PlanUpdated -= OnEditAgentPlanUpdated;
-                editAgent.PlanUpdated += OnEditAgentPlanUpdated;
-            }
 
             return agent;
         }

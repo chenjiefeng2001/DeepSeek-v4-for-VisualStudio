@@ -129,10 +129,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 });
 
                 // 添加会话历史（最近 10 轮）
-                int historyStart = Math.Max(0, context.ConversationHistory.Count - 20);
-                for (int i = historyStart; i < context.ConversationHistory.Count; i++)
+                if (context.ConversationHistory.Count > 0)
                 {
-                    messages.Add(context.ConversationHistory[i]);
+                    int historyStart = Math.Max(0, context.ConversationHistory.Count - 20);
+                    for (int i = historyStart; i < context.ConversationHistory.Count; i++)
+                    {
+                        var histMsg = context.ConversationHistory[i];
+                        // 无工具调用的 assistant 消息不带 reasoning_content（API 会忽略）
+                        var apiMsg = new ChatApiMessage
+                        {
+                            Role = histMsg.Role,
+                            Content = histMsg.Content,
+                        };
+                        messages.Add(apiMsg);
+                    }
                 }
 
                 // 添加上下文信息

@@ -332,6 +332,13 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         [DataMember]
         public List<ChatMessage> Messages { get; set; } = new();
 
+        /// <summary>
+        /// API 级别的完整对话历史（含 tool 消息、reasoning_content 等）。
+        /// 用于完整恢复上下文，与 UI 消息列表互补。
+        /// </summary>
+        [DataMember]
+        public List<ChatApiMessage> ApiHistory { get; set; } = new();
+
         [DataMember]
         public DateTime CreatedAt { get; set; } = DateTime.Now;
 

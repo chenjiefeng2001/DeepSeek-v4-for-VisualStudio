@@ -1,4 +1,6 @@
-﻿using DeepSeek_v4_for_VisualStudio.Utils;
+﻿using DeepSeek_v4_for_VisualStudio.Services;
+using DeepSeek_v4_for_VisualStudio.Settings;
+using DeepSeek_v4_for_VisualStudio.Utils;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.ComponentModelHost;
 using Microsoft.VisualStudio.Editor;
@@ -20,6 +22,43 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
     /// </summary>
     public static class TerminalWindowHelper
     {
+        /// <summary>
+        /// 全局开关：设为 true 时抑制所有 diff 预览。
+        /// EditAgent 在批量修改期间设为 true，流程结束时再统一显示一次最终 diff。
+        /// </summary>
+        public static bool SuppressDiffPreview { get; set; }
+
+        /// <summary>
+        /// 在流程结束时统一显示一次最终 diff 预览。
+        /// 比较原始内容和最终内容，在编辑器中激活差异标记。
+        /// </summary>
+        /// <param name="oldContent">修改前的内容（新建文件传空字符串）</param>
+        /// <param name="newContent">修改后的最终内容</param>
+        /// <param name="filePath">文件完整路径</param>
+        public static async Task ShowFinalDiffAsync(string oldContent, string newContent, string filePath)
+        {
+            if (oldContent == newContent) return;
+
+            bool showDiff = DeepSeekOptionsPage.Instance?.ShowDiffMarkersInEditor ?? true;
+            if (!showDiff) return;
+
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+            try
+            {
+                var wpfView = FindWpfTextViewForFile(filePath);
+                if (wpfView != null)
+                {
+                    EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newContent);
+                    Logger.Info($"[WriteCode] 最终 diff 预览已激活: {Path.GetFileName(filePath)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[WriteCode] 激活最终 diff 预览失败: {ex.Message}");
+            }
+        }
+
         #region Public Methods
 
         /// <summary>
@@ -32,7 +71,6 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
         /// 返回 null 表示成功；返回错误字符串表示失败原因。
         /// 
         /// API 参考：
-        /// - IVsInvisibleEditorManager: https://learn.microsoft.com/visualstudio/extensibility/using-the-invisible-editor
         /// - IVsTextLines / ITextBuffer: https://learn.microsoft.com/visualstudio/extensibility/inside-the-editor
         /// </summary>
         /// <param name="filePath">目标文件的完整路径。</param>
@@ -81,6 +119,9 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
                     ITextBuffer? targetBuffer = FindOpenTextBufferForFile(filePath, editorAdapter);
                     if (targetBuffer != null)
                     {
+                        // 读取旧内容（用于 diff 预览）
+                        string oldContent = targetBuffer.CurrentSnapshot.GetText();
+
                         using (var edit = targetBuffer.CreateEdit())
                         {
                             var snapshot = targetBuffer.CurrentSnapshot;
@@ -95,6 +136,9 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
                         {
                             textDoc.Save();
                         }
+
+                        // 触发编辑器内 diff 预览
+                        TryBeginDiffPreview(oldContent, newContent, filePath);
 
                         Logger.Info($"[WriteCode] ✅ 通过 ITextBuffer 写入已打开文件: {Path.GetFileName(filePath)}");
                         return null;
@@ -124,6 +168,8 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
                             var textBuffer = editorAdapter.GetDataBuffer(vsTextBuffer);
                             if (textBuffer != null)
                             {
+                                string oldContent = textBuffer.CurrentSnapshot.GetText();
+
                                 using (var edit = textBuffer.CreateEdit())
                                 {
                                     var snapshot = textBuffer.CurrentSnapshot;
@@ -138,6 +184,9 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
                                 {
                                     textDoc.Save();
                                 }
+
+                                // 文件未在编辑器中打开，注册待处理 diff
+                                TryRegisterPendingDiff(oldContent, newContent, filePath);
 
                                 Logger.Info($"[WriteCode] ✅ 通过 IVsInvisibleEditor+ITextBuffer 写入: {Path.GetFileName(filePath)}");
                                 return null;
@@ -252,6 +301,114 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// 对已打开的编辑器文件尝试触发 diff 预览（红绿行标记 + 确认/撤销工具栏）。
+        /// </summary>
+        private static void TryBeginDiffPreview(string oldContent, string newContent, string filePath)
+        {
+            if (SuppressDiffPreview) return;
+
+            // 空旧内容表示新建文件，仍应显示 diff（全部为新增行）
+            if (oldContent == newContent)
+                return;
+
+            bool showDiff = DeepSeekOptionsPage.Instance?.ShowDiffMarkersInEditor ?? true;
+            if (!showDiff)
+                return;
+
+            try
+            {
+                var wpfView = FindWpfTextViewForFile(filePath);
+                if (wpfView != null)
+                {
+                    EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newContent);
+                    Logger.Info($"[WriteCode] 编辑器内 diff 预览已激活: {Path.GetFileName(filePath)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[WriteCode] 激活 diff 预览失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 通过枚举 VS 所有打开的文档窗口，查找指定文件路径对应的 <see cref="IWpfTextView"/>。
+        /// </summary>
+        private static IWpfTextView? FindWpfTextViewForFile(string filePath)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                var uiShell = (IVsUIShell?)ServiceProvider.GlobalProvider.GetService(typeof(SVsUIShell));
+                if (uiShell == null) return null;
+
+                uiShell.GetDocumentWindowEnum(out IEnumWindowFrames? enumFrames);
+                if (enumFrames == null) return null;
+
+                var componentModel = (IComponentModel)ServiceProvider.GlobalProvider.GetService(typeof(SComponentModel));
+                var editorAdapter = componentModel?.DefaultExportProvider
+                    .GetExport<IVsEditorAdaptersFactoryService>()?.Value;
+                if (editorAdapter == null) return null;
+
+                IVsWindowFrame[] frames = new IVsWindowFrame[1];
+
+                while (enumFrames.Next(1, frames, out uint fetched) == VSConstants.S_OK && fetched == 1)
+                {
+                    var frame = frames[0];
+
+                    // 获取文档的完整路径
+                    object pathObj;
+                    frame.GetProperty((int)__VSFPROPID.VSFPROPID_pszMkDocument, out pathObj);
+                    string? framePath = pathObj as string;
+
+                    if (string.IsNullOrEmpty(framePath) ||
+                        !string.Equals(framePath, filePath, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    // 路径匹配 → 获取 IVsTextView
+                    var vsTextView = VsShellUtilities.GetTextView(frame);
+                    if (vsTextView != null)
+                    {
+                        var wpfView = editorAdapter.GetWpfTextView(vsTextView);
+                        if (wpfView != null)
+                            return wpfView;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[WriteCode] 查找 IWpfTextView 失败: {ex.Message}");
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 对未在编辑器中打开的文件注册待处理 diff，用户稍后打开文件时自动激活预览。
+        /// </summary>
+        private static void TryRegisterPendingDiff(string oldContent, string newContent, string filePath)
+        {
+            if (SuppressDiffPreview) return;
+
+            if (string.IsNullOrEmpty(oldContent) || oldContent == newContent)
+                return;
+
+            bool showDiff = DeepSeekOptionsPage.Instance?.ShowDiffMarkersInEditor ?? true;
+            if (!showDiff)
+                return;
+
+            try
+            {
+                EditorDiffMarkerService.Instance.RegisterPendingDiff(filePath, oldContent, newContent);
+                Logger.Info($"[WriteCode] 已注册待处理 diff: {Path.GetFileName(filePath)}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[WriteCode] 注册待处理 diff 失败: {ex.Message}");
+            }
         }
 
         /// <summary>

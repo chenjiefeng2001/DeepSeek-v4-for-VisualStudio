@@ -124,6 +124,41 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         Logger.Info($"文件解析完成: {attachedFileNames.Count} 个文件");
                     }
                 }
+                // ── 自动附加解决方案文件：委托 ExploreAgent 智能发现相关文件 ──
+                else if (!string.IsNullOrEmpty(_solutionPath)
+                    && _agentDispatcher != null
+                    && !ExploreAgent.UserMessageReferencesFiles(userText))
+                {
+                    try
+                    {
+                        StatusLabel.Text = "ExploreAgent 正在智能搜索相关文件…";
+                        var exploreAgent = _agentDispatcher.ExploreAgent;
+                        // 使用智能发现：根据用户问题模糊搜索相关文件
+                        var discoveredFiles = await exploreAgent.DiscoverRelevantFilesAsync(
+                            _solutionPath, userText ?? string.Empty);
+                        if (discoveredFiles.Count > 0)
+                        {
+                            foreach (var file in discoveredFiles)
+                                _attachedFilePaths.Add(file);
+
+                            StatusLabel.Text = $"正在解析相关文件 ({discoveredFiles.Count} 个)…";
+                            parseResults = await FileParserService.ParseFilesAsync(_attachedFilePaths);
+                            attachedFileNames = parseResults
+                                .Where(r => r.Success)
+                                .Select(r => r.FileName)
+                                .ToList();
+                            fileContext = FileParserService.FormatParseResultsForContext(parseResults);
+                            if (!string.IsNullOrEmpty(fileContext))
+                            {
+                                Logger.Info($"[ExploreAgent] 智能文件发现完成: {attachedFileNames.Count} 个文件");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[ExploreAgent] 智能文件发现失败: {ex.Message}");
+                    }
+                }
 
                 // ── 构建完整的用户消息内容 ──
                 string userDisplayContent = userText ?? string.Empty;
@@ -180,7 +215,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         lock (_lock)
                         {
                             _messages.Add(agentUserMsg);
-                            _conversationHistory.Add(new ChatApiMessage { Role = "user", Content = fullUserContent });
+                            _contextManager.AddUserMessage(fullUserContent);
                         }
                         AddMessagesHtml("user", userDisplayContent, null, parseResults);
                         UpdateBrowser();
@@ -243,11 +278,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     // ── 如果用户通过 /skill-name 调用了技能，先注入技能指令 ──
                     if (!string.IsNullOrEmpty(skillInstructions))
                     {
-                        _conversationHistory.Add(new ChatApiMessage
-                        {
-                            Role = "system",
-                            Content = skillInstructions
-                        });
+                        _contextManager.AddCustomMessage("system", skillInstructions);
 
                         // ── 日志：记录技能指令注入 ──
                         if (isSlashCommand)
@@ -271,7 +302,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         }
                     }
 
-                    _conversationHistory.Add(new ChatApiMessage { Role = "user", Content = fullUserContent });
+                    _contextManager.AddUserMessage(fullUserContent);
                 }
 
                 // ── 清空附件列表 ──
@@ -609,12 +640,10 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
                             if (assistantToolCalls.Count > 0)
                             {
-                                _conversationHistory.Add(new ChatApiMessage
-                                {
-                                    Role = "assistant",
-                                    Content = contentBuffer.Length > 0 ? contentBuffer.ToString() : null,
-                                    ToolCalls = assistantToolCalls
-                                });
+                                _contextManager.AddAssistantMessage(
+                                    contentBuffer.Length > 0 ? contentBuffer.ToString() : null,
+                                    reasoningBuffer.Length > 0 ? reasoningBuffer.ToString() : null,
+                                    assistantToolCalls);
                             }
 
                             // ── 执行每个工具调用并将结果加入对话历史 ──
@@ -642,13 +671,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                                 }
 
                                 // 添加 tool 角色消息
-                                _conversationHistory.Add(new ChatApiMessage
-                                {
-                                    Role = "tool",
-                                    Content = toolResult,
-                                    ToolCallId = acc.Id,
-                                    Name = acc.FunctionName
-                                });
+                                _contextManager.AddToolResult(acc.Id, acc.FunctionName!, toolResult);
 
                                 Logger.Info($"[MCP] 工具 {acc.FunctionName} 返回: {(toolResult.Length > 200 ? toolResult.Substring(0, 200) + "..." : toolResult)}");
                             }
@@ -692,7 +715,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         await ChatWebView.CoreWebView2.ExecuteScriptAsync(searchCardJs);
                     }
 
-                    _conversationHistory.Add(new ChatApiMessage { Role = "assistant", Content = contentBuffer.ToString() });
+                    _contextManager.AddAssistantMessage(
+                        contentBuffer.ToString(),
+                        reasoningBuffer.Length > 0 ? reasoningBuffer.ToString() : null);
 
                     // 后台持久化
                     var capturedMsg = assistantMsg;
@@ -850,10 +875,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
             // ── 构建优化提示词 ──
             string contextSummary = string.Empty;
-            if (_conversationHistory.Count > 1)
+            var history = _contextManager.GetConversationHistory();
+            if (history.Count > 1)
             {
                 // 取最近几条用户消息作为上下文
-                var recent = _conversationHistory
+                var recent = history
                     .Where(m => m.Role == "user")
                     .Reverse()
                     .Take(3)
@@ -1092,17 +1118,15 @@ namespace DeepSeek_v4_for_VisualStudio.View
         /// <summary>
         /// 构建发送给 API 的消息列表。
         /// 当启用联网搜索时，将搜索结果作为系统消息注入到对话历史之前。
-        /// 保留工具调用消息（tool_calls / tool_call_id），确保多轮工具调用正常工作。
+        /// 委托给 ConversationContextManager 统一处理 reasoning_content 回传规则。
         /// </summary>
         /// <param name="searchContext">联网搜索的结果上下文，为空则不注入。</param>
         private List<ChatApiMessage> BuildRequestMessages(string searchContext = "")
         {
-            var messages = new List<ChatApiMessage>();
-
-            // ── 系统提示词 ──
+            // ── 同步系统提示词到上下文管理器 ──
             string systemPrompt = _options?.SystemPrompt ?? string.Empty;
 
-            // ── 注入 AskAgent 系统提示词（当走问答路径时）──
+            // 注入 AskAgent 系统提示词（当走问答路径时）
             if (_agentDispatcher != null)
             {
                 string askAgentPrompt = _agentDispatcher.AskAgent.Definition.SystemPrompt;
@@ -1114,68 +1138,38 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(systemPrompt))
+            _contextManager.SetSystemPrompt(
+                string.IsNullOrWhiteSpace(systemPrompt) ? null : systemPrompt);
+
+            // ── 注入 Skill 发现上下文 ──
+            string skillContext = string.Empty;
+            try
             {
-                // ── 注入 Skill 发现上下文 ──
-                string skillContext = string.Empty;
-                try
+                if (_skillDiscoveryResult == null)
                 {
-                    if (_skillDiscoveryResult == null)
-                    {
-                        // 首次使用时快速同步发现（已有缓存）
-                        _skillDiscoveryResult = SkillService.Instance.DiscoverSkillsAsync(_solutionPath).Result;
-                    }
-                    skillContext = SkillService.Instance.GenerateSkillsDiscoveryContext(_skillDiscoveryResult);
+                    _skillDiscoveryResult = SkillService.Instance.DiscoverSkillsAsync(_solutionPath).Result;
                 }
-                catch (Exception ex)
-                {
-                    Logger.Warn($"[Skill] 构建技能上下文失败: {ex.Message}");
-                }
+                skillContext = SkillService.Instance.GenerateSkillsDiscoveryContext(_skillDiscoveryResult);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[Skill] 构建技能上下文失败: {ex.Message}");
+            }
+            _contextManager.SetSkillContext(
+                string.IsNullOrWhiteSpace(skillContext) ? null : skillContext);
 
-                string finalSystemPrompt = systemPrompt;
-                if (!string.IsNullOrWhiteSpace(skillContext))
-                {
-                    finalSystemPrompt = systemPrompt + "\n\n" + skillContext;
-                    // ── 日志：记录注入的 Skill 发现上下文 ──
-                    if (_skillDiscoveryResult != null)
-                    {
-                        var skillNames = string.Join(", ", _skillDiscoveryResult.AutoLoadableSkills.ConvertAll(s => s.Name));
-                        Logger.Info($"[Skill] 系统提示注入可用技能列表: {_skillDiscoveryResult.AutoLoadableSkills.Count} 个 → {skillNames}");
-                    }
-                }
-
-                messages.Add(new ChatApiMessage { Role = "system", Content = finalSystemPrompt });
+            if (!string.IsNullOrWhiteSpace(skillContext) && _skillDiscoveryResult != null)
+            {
+                var skillNames = string.Join(", ", _skillDiscoveryResult.AutoLoadableSkills.ConvertAll(s => s.Name));
+                Logger.Info($"[Skill] 系统提示注入可用技能列表: {_skillDiscoveryResult.AutoLoadableSkills.Count} 个 → {skillNames}");
             }
 
-            // ── 注入联网搜索结果作为系统消息 ──
-            if (!string.IsNullOrWhiteSpace(searchContext))
-            {
-                messages.Add(new ChatApiMessage { Role = "system", Content = searchContext });
-            }
+            // ── 注入搜索上下文 ──
+            _contextManager.SetSearchContext(
+                string.IsNullOrWhiteSpace(searchContext) ? null : searchContext);
 
-            // ── 对话历史（保留 tool_calls / tool_call_id 字段） ──
-            foreach (var m in _conversationHistory)
-            {
-                var apiMsg = new ChatApiMessage
-                {
-                    Role = m.Role,
-                    Content = m.Content,
-                };
-
-                // 保留工具调用相关字段
-                if (m.ToolCalls != null && m.ToolCalls.Count > 0)
-                    apiMsg.ToolCalls = m.ToolCalls;
-
-                if (!string.IsNullOrEmpty(m.ToolCallId))
-                    apiMsg.ToolCallId = m.ToolCallId;
-
-                if (!string.IsNullOrEmpty(m.Name))
-                    apiMsg.Name = m.Name;
-
-                messages.Add(apiMsg);
-            }
-
-            return messages;
+            // ── 委托上下文管理器构建完整的 API 消息列表 ──
+            return _contextManager.BuildApiMessages();
         }
 
         private void StopGeneration()
@@ -2067,7 +2061,7 @@ user-invocable: true
                 {
                     SolutionPath = _solutionPath,
                     FileContext = fileContext,
-                    ConversationHistory = new List<ChatApiMessage>(_conversationHistory),
+                    ConversationHistory = _contextManager.GetConversationHistory(),
                     ReadFileAsync = async (path) =>
                     {
                         if (File.Exists(path))
@@ -2338,8 +2332,8 @@ user-invocable: true
                         history.Add(oldAssistantMsg);
 
                     // ── 回退对话历史：移除当前助手消息及其后的所有消息 ──
-                    // 从 _conversationHistory 中移除对应的 assistant 条目
-                    RemoveConversationHistoryAfter(userMsgIndex);
+                    // 从对话上下文中移除对应的 assistant 条目
+                    TrimContextAfterUserMessage(userMsgIndex);
                 }
 
                 // ── 重新发送用户消息 ──
@@ -2464,8 +2458,8 @@ user-invocable: true
                     userMsg.Content = newContent;
 
                     // 回退对话历史
-                    RemoveConversationHistoryAfter(userMsgIndex);
-                    _conversationHistory.Add(new ChatApiMessage { Role = "user", Content = newContent });
+                    TrimContextAfterUserMessage(userMsgIndex);
+                    _contextManager.AddUserMessage(newContent);
                 }
 
                 RebuildMessagesHtml();
@@ -2556,10 +2550,11 @@ user-invocable: true
         }
 
         /// <summary>
-        /// 从 _conversationHistory 中移除 userMsgIndex 对应的用户消息之后的所有条目。
-        /// 用于回退对话上下文。通过查找最后一个 user 角色消息来定位。
+        /// 从对话上下文中移除最后一个用户消息及其之后的所有条目。
+        /// 用于回退对话上下文。委托给 ConversationContextManager。
+        /// 注意：此方法只做截断，不重新添加消息。调用方负责重新添加用户消息。
         /// </summary>
-        private void RemoveConversationHistoryAfter(int userMsgIndex)
+        private void TrimContextAfterUserMessage(int userMsgIndex)
         {
             lock (_lock)
             {
@@ -2568,50 +2563,9 @@ user-invocable: true
                 var userMsg = _messages[userMsgIndex];
                 if (userMsg.Role != "user") return;
 
-                // 在 _conversationHistory 中找到该用户消息对应的条目
-                // 策略：从末尾向前搜索，找到的用户消息条目就是最近添加的，
-                // 它应当对应 _messages[userMsgIndex]
-                int historyIdx = -1;
-
-                // 首先尝试：从末尾向前找第一个 user 角色的消息
-                for (int i = _conversationHistory.Count - 1; i >= 0; i--)
-                {
-                    if (_conversationHistory[i].Role == "user")
-                    {
-                        // 验证内容是否匹配（使用 Contains 宽松匹配，因为 history 可能包含文件上下文）
-                        string historyContent = _conversationHistory[i].Content ?? string.Empty;
-                        string searchContent = userMsg.OriginalContent ?? userMsg.Content ?? string.Empty;
-
-                        if (historyContent.Contains(searchContent) ||
-                            searchContent.Contains(historyContent) ||
-                            string.Equals(historyContent.Trim(), searchContent.Trim(), StringComparison.Ordinal))
-                        {
-                            historyIdx = i;
-                            break;
-                        }
-                    }
-                }
-
-                // 回退策略：如果内容不匹配，使用最后一个 user 消息
-                if (historyIdx < 0)
-                {
-                    for (int i = _conversationHistory.Count - 1; i >= 0; i--)
-                    {
-                        if (_conversationHistory[i].Role == "user")
-                        {
-                            historyIdx = i;
-                            Logger.Warn($"[Retry/Edit] 内容匹配失败，使用最后一个 user 消息 (索引 {i}) 作为回退");
-                            break;
-                        }
-                    }
-                }
-
-                if (historyIdx >= 0)
-                {
-                    int removeCount = _conversationHistory.Count - historyIdx;
-                    _conversationHistory.RemoveRange(historyIdx, removeCount);
-                    Logger.Info($"[Retry/Edit] 已从对话历史移除 {removeCount} 条消息 (从索引 {historyIdx})");
-                }
+                // 委托上下文管理器从内部找到最后一个 user 消息并截断
+                _contextManager.TrimAfterLastUserMessage();
+                Logger.Info($"[Retry/Edit] 已从对话上下文截断（用户消息索引: {userMsgIndex}）");
             }
         }
 
@@ -2686,12 +2640,13 @@ user-invocable: true
 
             try
             {
-                // ── 确保用户消息在对话历史中（如果已被 RemoveConversationHistoryAfter 移除则重新添加） ──
+                // ── 确保用户消息在对话历史中（如果已被 TrimContextAfterUserMessage 移除则重新添加） ──
                 lock (_lock)
                 {
                     bool userExistsInHistory = false;
                     string searchContent = userMsg.Content ?? string.Empty;
-                    foreach (var m in _conversationHistory)
+                    var history = _contextManager.GetConversationHistory();
+                    foreach (var m in history)
                     {
                         if (m.Role == "user" &&
                             ((m.Content?.Contains(searchContent) == true) ||
@@ -2712,7 +2667,7 @@ user-invocable: true
                             if (!string.IsNullOrEmpty(fileContext))
                                 fullUserContent = fileContext + "\n" + fullUserContent;
                         }
-                        _conversationHistory.Add(new ChatApiMessage { Role = "user", Content = fullUserContent });
+                        _contextManager.AddUserMessage(fullUserContent);
                         Logger.Info("[Retry] 已将用户消息重新加入对话历史");
                     }
                 }
@@ -2806,7 +2761,9 @@ user-invocable: true
                     reasoningBuffer.ToString());
                 await ChatWebView.CoreWebView2.ExecuteScriptAsync(finalJs);
 
-                _conversationHistory.Add(new ChatApiMessage { Role = "assistant", Content = contentBuffer.ToString() });
+                _contextManager.AddAssistantMessage(
+                    contentBuffer.ToString(),
+                    reasoningBuffer.Length > 0 ? reasoningBuffer.ToString() : null);
 
                 // ── 更新版本信息：将新回复也加入版本历史 ──
                 lock (_lock)

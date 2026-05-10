@@ -60,7 +60,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
         private bool _solutionEventsWired;
 
         private readonly List<ChatMessage> _messages = new();
-        private readonly List<ChatApiMessage> _conversationHistory = new();
+        private readonly ConversationContextManager _contextManager = new();
         private bool _isGenerating;
         private string _webSearchEngine = "Off"; // "Off" | "Baidu" | "DuckDuckGo"
         private readonly List<string> _pendingWarnings = new(); // 待注入的警告消息
@@ -162,7 +162,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
             DeepSeekOptionsPage.SettingsChanged += OnOcrSettingsChanged;
 
             // ── 订阅 diff 预览状态事件，刷新全局控制栏 ──
-            EditorDiffMarkerService.Instance.PreviewStateChanged += _ => RefreshDiffGlobalBar();
             EditorDiffMarkerService.Instance.PendingDiffCountChanged += RefreshDiffGlobalBar;
 
             // ── 订阅解决方案事件，切换解决方案时自动重载对话 ──
@@ -564,7 +563,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     await Microsoft.VisualStudio.Shell.ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
                     _messages.Clear();
-                    _conversationHistory.Clear();
+                    _contextManager.Clear();
                     _messagesHtml.Clear();
                     _lastRenderedMessagesLength = 0;
 
@@ -603,33 +602,44 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
             // 加载活跃会话的消息
             _messages.Clear();
-            _conversationHistory.Clear();
+            _contextManager.Clear();
 
             if (_activeSession.Messages.Count > 0)
             {
                 Logger.Info($"[Render] LoadConversation: 从会话 '{_activeSession.Title}' 加载了 {_activeSession.Messages.Count} 条消息");
+
+                // ── 优先使用 ApiHistory 恢复完整上下文（含 tool 消息） ──
+                if (_activeSession.ApiHistory.Count > 0)
+                {
+                    _contextManager.RestoreFullContext(_activeSession.ApiHistory);
+                }
+                else
+                {
+                    // 回退：从 UI 消息列表重建（旧版会话兼容）
+                    foreach (var msg in _activeSession.Messages)
+                    {
+                        msg.IsStreaming = false;
+                        if (msg.Role is "user" or "assistant")
+                        {
+                            string apiContent = msg.Content ?? string.Empty;
+                            if (msg.Role == "user" && msg.AttachedFiles.Count > 0)
+                            {
+                                string fileContext = FileParserService.FormatParseResultsForContext(msg.AttachedFiles);
+                                if (!string.IsNullOrEmpty(fileContext))
+                                    apiContent = fileContext + "\n" + apiContent;
+                            }
+                            if (msg.Role == "user")
+                                _contextManager.AddUserMessage(apiContent);
+                            else
+                                _contextManager.AddAssistantMessage(apiContent, msg.ReasoningContent);
+                        }
+                    }
+                }
+
                 foreach (var msg in _activeSession.Messages)
                 {
                     msg.IsStreaming = false;
                     _messages.Add(msg);
-                    if (msg.Role is "user" or "assistant")
-                    {
-                        // 对用户消息，重构完整内容（用户文本 + 文件内容）发送给 AI
-                        string apiContent = msg.Content ?? string.Empty;
-                        if (msg.Role == "user" && msg.AttachedFiles.Count > 0)
-                        {
-                            string fileContext = FileParserService.FormatParseResultsForContext(msg.AttachedFiles);
-                            if (!string.IsNullOrEmpty(fileContext))
-                            {
-                                apiContent = fileContext + "\n" + apiContent;
-                            }
-                        }
-                        _conversationHistory.Add(new ChatApiMessage
-                        {
-                            Role = msg.Role,
-                            Content = apiContent,
-                        });
-                    }
                 }
             }
 

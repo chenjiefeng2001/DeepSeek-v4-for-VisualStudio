@@ -752,24 +752,6 @@ window.decorateCodeBlocks=function(container){
             setTimeout(function(){applyBtn.textContent='⚡ 写入';applyBtn.classList.remove('copied');},1500);
         };
         pre.appendChild(applyBtn);
-        // Diff 按钮 - 显示代码变更
-        var diffBtn=document.createElement('button');
-        diffBtn.className='copy-btn';
-        diffBtn.textContent='📊 对比';
-        diffBtn.title='显示原始代码和AI修改后的差异';
-        diffBtn.style.right='122px';
-        diffBtn.onclick=function(){
-            var target=pre.querySelector('code')||pre;
-            var codeText=target.innerText;
-            try{
-                window.chrome.webview.postMessage(JSON.stringify({type:'showDiff',code:codeText}));
-            }catch(e1){
-                try{
-                    window.external.notify(JSON.stringify({type:'showDiff',code:codeText}));
-                }catch(e2){}
-            }
-        };
-        pre.appendChild(diffBtn);
     });
 };
 ";
@@ -850,23 +832,6 @@ pres.forEach(function(pre){
         setTimeout(function(){applyBtn.textContent='⚡ 写入';applyBtn.classList.remove('copied');},1500);
     };
     pre.appendChild(applyBtn);
-    var diffBtn=document.createElement('button');
-    diffBtn.className='copy-btn';
-    diffBtn.textContent='📊 对比';
-    diffBtn.title='显示原始代码和AI修改后的差异';
-    diffBtn.style.right='122px';
-    diffBtn.onclick=function(){
-        var target=pre.querySelector('code')||pre;
-        var codeText=target.innerText;
-        try{
-            window.chrome.webview.postMessage(JSON.stringify({type:'showDiff',code:codeText}));
-        }catch(e1){
-            try{
-                window.external.notify(JSON.stringify({type:'showDiff',code:codeText}));
-            }catch(e2){}
-        }
-    };
-    pre.appendChild(diffBtn);
 });
 })();";
         }

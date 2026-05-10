@@ -39,6 +39,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
             if (_activeSession == null || _sessionsContainer == null) return;
 
             _activeSession.Messages = _messages.ToList();
+            _activeSession.ApiHistory = _contextManager.GetFullContext();
             _activeSession.LastActiveAt = DateTime.Now;
             _sessionsContainer.ActiveSessionId = _activeSession.Id;
             ChatPersistenceService.SaveSessions(_solutionPath, _sessionsContainer);
@@ -103,9 +104,40 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
                     // 清空并加载消息
                     _messages.Clear();
-                    _conversationHistory.Clear();
+                    _contextManager.Clear();
                     _messagesHtml.Clear();
                     _lastRenderedMessagesLength = 0;
+                }
+
+                // ── 优先使用 ApiHistory 恢复完整上下文（含 tool 消息） ──
+                if (_activeSession.ApiHistory.Count > 0)
+                {
+                    _contextManager.RestoreFullContext(_activeSession.ApiHistory);
+                }
+                else
+                {
+                    // 回退：从 UI 消息列表重建（旧版会话兼容）
+                    foreach (var msg in _activeSession.Messages)
+                    {
+                        msg.IsStreaming = false;
+                        if (msg.Role is "user" or "assistant")
+                        {
+                            string apiContent = msg.Content ?? string.Empty;
+                            if (msg.Role == "user" && msg.AttachedFiles.Count > 0)
+                            {
+                                string fileContext = FileParserService.FormatParseResultsForContext(msg.AttachedFiles);
+                                if (!string.IsNullOrEmpty(fileContext))
+                                    apiContent = fileContext + "\n" + apiContent;
+                            }
+                            lock (_lock)
+                            {
+                                if (msg.Role == "user")
+                                    _contextManager.AddUserMessage(apiContent);
+                                else
+                                    _contextManager.AddAssistantMessage(apiContent, msg.ReasoningContent);
+                            }
+                        }
+                    }
                 }
 
                 foreach (var msg in _activeSession.Messages)
@@ -114,27 +146,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     lock (_lock)
                     {
                         _messages.Add(msg);
-                    }
-                    if (msg.Role is "user" or "assistant")
-                    {
-                        // 对用户消息，重构完整内容（用户文本 + 文件内容）发送给 AI
-                        string apiContent = msg.Content ?? string.Empty;
-                        if (msg.Role == "user" && msg.AttachedFiles.Count > 0)
-                        {
-                            string fileContext = FileParserService.FormatParseResultsForContext(msg.AttachedFiles);
-                            if (!string.IsNullOrEmpty(fileContext))
-                            {
-                                apiContent = fileContext + "\n" + apiContent;
-                            }
-                        }
-                        lock (_lock)
-                        {
-                            _conversationHistory.Add(new ChatApiMessage
-                            {
-                                Role = msg.Role,
-                                Content = apiContent,
-                            });
-                        }
                     }
                 }
 
@@ -215,7 +226,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 {
                     // 清空并添加欢迎语
                     _messages.Clear();
-                    _conversationHistory.Clear();
+                    _contextManager.Clear();
                     _messagesHtml.Clear();
                     _lastRenderedMessagesLength = 0;
                 }
@@ -297,38 +308,46 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 {
                     // 加载新会话消息
                     _messages.Clear();
-                    _conversationHistory.Clear();
+                    _contextManager.Clear();
                     _messagesHtml.Clear();
                     _lastRenderedMessagesLength = 0;
                 }
 
                 if (_activeSession != null)
                 {
+                    // ── 优先使用 ApiHistory 恢复完整上下文 ──
+                    if (_activeSession.ApiHistory.Count > 0)
+                    {
+                        _contextManager.RestoreFullContext(_activeSession.ApiHistory);
+                    }
+                    else
+                    {
+                        foreach (var msg in _activeSession.Messages)
+                        {
+                            msg.IsStreaming = false;
+                            if (msg.Role is "user" or "assistant")
+                            {
+                                string apiContent = msg.Content ?? string.Empty;
+                                if (msg.Role == "user" && msg.AttachedFiles.Count > 0)
+                                {
+                                    string fileContext = FileParserService.FormatParseResultsForContext(msg.AttachedFiles);
+                                    if (!string.IsNullOrEmpty(fileContext))
+                                        apiContent = fileContext + "\n" + apiContent;
+                                }
+                                lock (_lock)
+                                {
+                                    if (msg.Role == "user")
+                                        _contextManager.AddUserMessage(apiContent);
+                                    else
+                                        _contextManager.AddAssistantMessage(apiContent, msg.ReasoningContent);
+                                }
+                            }
+                        }
+                    }
                     foreach (var msg in _activeSession.Messages)
                     {
                         msg.IsStreaming = false;
                         lock (_lock) { _messages.Add(msg); }
-                        if (msg.Role is "user" or "assistant")
-                        {
-                            // 对用户消息，重构完整内容（用户文本 + 文件内容）发送给 AI
-                            string apiContent = msg.Content ?? string.Empty;
-                            if (msg.Role == "user" && msg.AttachedFiles.Count > 0)
-                            {
-                                string fileContext = FileParserService.FormatParseResultsForContext(msg.AttachedFiles);
-                                if (!string.IsNullOrEmpty(fileContext))
-                                {
-                                    apiContent = fileContext + "\n" + apiContent;
-                                }
-                            }
-                            lock (_lock)
-                            {
-                                _conversationHistory.Add(new ChatApiMessage
-                                {
-                                    Role = msg.Role,
-                                    Content = apiContent,
-                                });
-                            }
-                        }
                     }
                 }
 
@@ -360,7 +379,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 lock (_lock)
                 {
                     _messages.Clear();
-                    _conversationHistory.Clear();
+                    _contextManager.Clear();
                     _messagesHtml.Clear();
                     _lastRenderedMessagesLength = 0;
                 }
@@ -368,6 +387,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 if (_activeSession != null)
                 {
                     _activeSession.Messages.Clear();
+                    _activeSession.ApiHistory.Clear();
                     _activeSession.Title = "新对话";
                 }
 

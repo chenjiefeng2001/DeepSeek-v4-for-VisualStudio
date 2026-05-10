@@ -1218,12 +1218,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
                             ? codeProp.GetString() ?? string.Empty : string.Empty;
                         ApplyCodeToActiveDocument(code);
                     }
-                    else if (type == "showDiff")
-                    {
-                        string code = obj.TryGetProperty("code", out var diffCodeProp)
-                            ? diffCodeProp.GetString() ?? string.Empty : string.Empty;
-                        ApplyCodeToActiveDocument(code);
-                    }
                     else if (type == "retryMessage")
                     {
                         int msgIndex = obj.TryGetProperty("messageIndex", out var retryIdxProp)
