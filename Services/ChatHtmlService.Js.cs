@@ -175,6 +175,9 @@ window.__fileDeleteConfirm=function(requestId){
 };
 window.__fileDeleteCancel=function(requestId){
     window.__sendToHost({type:'fileDeleteConfirm',requestId:requestId,confirmed:false});
+};
+window.__executeHandoff=function(targetAgent,label){
+    window.__sendToHost({type:'executeHandoff',targetAgent:targetAgent,label:label});
 };";
         }
 

@@ -204,6 +204,81 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         }
 
         /// <summary>
+        /// 构建 Handoff 按钮的 JavaScript 注入脚本。
+        /// 在消息底部渲染一个"▶ 开始实现"按钮，点击后触发 Agent Handoff。
+        /// </summary>
+        /// <param name="messageIndex">要附加按钮的消息索引</param>
+        /// <param name="targetAgent">目标 Agent 类型（如 "Edit"）</param>
+        /// <param name="label">按钮显示文本</param>
+        /// <returns>JavaScript 脚本字符串</returns>
+        public static string BuildHandoffButtonJs(int messageIndex, string targetAgent, string label)
+        {
+            string escapedLabel = EscapeJsString(label);
+            string escapedTarget = EscapeJsString(targetAgent);
+            return $@"
+(function(){{
+    var msgDiv=document.getElementById('msg-{messageIndex}');
+    if(!msgDiv) return;
+    var existingBtn=document.getElementById('handoff-btn-{messageIndex}');
+    if(existingBtn) return;
+
+    var btn=document.createElement('button');
+    btn.id='handoff-btn-{messageIndex}';
+    btn.className='msg-action-btn handoff-btn';
+    btn.textContent='▶ {escapedLabel}';
+    btn.title='将计划移交给 Edit Agent 执行';
+    btn.style.cssText='background:#28a745;color:#fff;border:none;padding:8px 20px;border-radius:6px;cursor:pointer;font-size:14px;margin:10px 0;font-weight:600;';
+    btn.onmouseover=function(){{this.style.background='#218838';}};
+    btn.onmouseout=function(){{this.style.background='#28a745';}};
+    btn.onclick=function(){{window.__executeHandoff('{escapedTarget}','{escapedLabel}');}};
+
+    var msgBody=document.getElementById('msg-body-{messageIndex}');
+    if(msgBody) msgBody.parentNode.insertBefore(btn,msgBody.nextSibling);
+}})();";
+        }
+
+        /// <summary>
+        /// 构建 Cache 命中率统计卡片 HTML。
+        /// 用于注入到 AI 回复底部，展示本轮请求的 Prompt Cache 命中情况。
+        /// </summary>
+        /// <param name="hitTokens">缓存命中 token 数</param>
+        /// <param name="missTokens">缓存未命中 token 数</param>
+        /// <param name="promptTokens">Prompt 总 token 数</param>
+        /// <param name="completionTokens">Completion 总 token 数</param>
+        /// <param name="roundCount">多轮工具调用的轮次数（≥1）</param>
+        /// <returns>Cache 统计卡片的 HTML，若无数据则返回空字符串</returns>
+        public static string BuildCacheHitFooterHtml(long hitTokens, long missTokens, long promptTokens, long completionTokens, int roundCount = 1)
+        {
+            long cacheable = hitTokens + missTokens;
+            if (cacheable == 0) return string.Empty;
+
+            double rate = (double)hitTokens / cacheable;
+            string level = rate >= 0.95 ? "high" : rate >= 0.50 ? "medium" : "low";
+            string icon = rate >= 0.95 ? "🟢" : rate >= 0.50 ? "🟡" : "🔴";
+
+            // 命中率百分比
+            string rateText = $"{rate * 100:F1}%";
+
+            string roundInfo = roundCount > 1 ? $" · {roundCount} 轮" : "";
+
+            var sb = new StringBuilder();
+            sb.Append("<div class='cache-stat-card'>");
+            sb.Append($"<span class='cache-icon'>{icon}</span>");
+            sb.Append($"<span class='cache-rate {level}'>{rateText}</span>");
+            sb.Append("<div class='cache-bar-wrap'>");
+            sb.Append($"<div class='cache-bar-fill {level}' style='width:{rate * 100:F0}%'></div>");
+            sb.Append("</div>");
+            sb.Append("<span class='cache-detail'>");
+            sb.Append($"<span>{hitTokens:N0}</span> 命中 / <span>{missTokens:N0}</span> 未命中");
+            sb.Append($" · Prompt <span>{promptTokens:N0}</span> · Completion <span>{completionTokens:N0}</span>");
+            sb.Append(roundInfo);
+            sb.Append("</span>");
+            sb.Append("</div>");
+
+            return sb.ToString();
+        }
+
+        /// <summary>
         /// 构建联网搜索结果的 HTML 卡片（可折叠）。
         /// 用于在 AI 回复之前展示搜索到的网页结果。
         /// </summary>

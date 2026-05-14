@@ -97,6 +97,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             "manage_todo_list",
         };
 
+        /// <summary>
+        /// Edit Agent 代码步骤专用探索工具集（只读）。
+        /// AI 在编写代码前使用这些工具探索项目结构，避免盲写。
+        /// </summary>
+        private static readonly string[] ExplorationTools = new[]
+        {
+            "read_file",
+            "file_search",
+            "grep_search",
+            "list_dir",
+            "get_errors",
+            "get_changed_files",
+        };
+
         protected override AgentDefinition CreateDefinition(AgentType agentType)
         {
             return new AgentDefinition
@@ -123,6 +137,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 "- 遵循项目中已有的编码规范和架构模式\n" +
                 "- 优先使用项目已引入的框架和库\n" +
                 "- 删除文件前会要求用户确认，请只在必要时删除\n\n" +
+                "## 工作流程（重要！）\n" +
+                "- **必须先探索再修改**：使用 read_file / file_search / grep_search / list_dir 工具了解项目现有代码\n" +
+                "- 不要凭空猜测文件路径或代码结构——先读取相关文件确认\n" +
+                "- 探索完成后，基于实际代码进行修改\n\n" +
                 "## 代码输出格式\n" +
                 "修改文件时使用以下格式：\n" +
                 "```file:完整/绝对/路径\n" +
@@ -360,123 +378,48 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         }
 
         /// <summary>
-        /// 执行代码编写步骤（支持重试 + 缺失文件智能发现）。
-        /// 当 AI 表示缺少某些文件时，自动委托 ExploreAgent 搜索并补充上下文后重试。
+        /// 执行代码编写步骤（支持工具调用探索 + 格式重试）。
+        /// AI 先使用只读工具探索项目结构和现有代码，再输出 file: 格式的代码变更。
         /// </summary>
         private async Task ExecuteCodeStepAsync(
             AgentStep step, AgentTaskPlan plan, AgentContext context,
             string stepPrompt, CancellationToken ct)
         {
             const int maxFormatRetries = 2;
-            const int maxFileFetchRetries = 2;
             string result = string.Empty;
             List<FileChangeSummary> changes = new();
 
-            // ── 收集项目文件上下文：委托 ExploreAgent 智能发现相关文件 ──
-            string projectContext = await GatherProjectFilesContextAsync(
-                context.SolutionPath, step.Description);
-            string enrichedPrompt = stepPrompt;
-            if (!string.IsNullOrEmpty(projectContext))
-            {
-                enrichedPrompt += "\n\n## 项目现有文件参考\n" + projectContext;
-                AddLog("INFO", $"已读取项目文件上下文 ({projectContext.Split('\n').Length} 行)");
-            }
-
-            // ── 已尝试获取过的文件（防止重复获取）──
-            var fetchedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // ── 解析工作区根目录 ──
+            string workspaceRoot = context.SolutionPath ?? string.Empty;
+            if (!string.IsNullOrEmpty(workspaceRoot) && System.IO.File.Exists(workspaceRoot))
+                workspaceRoot = System.IO.Path.GetDirectoryName(workspaceRoot) ?? workspaceRoot;
 
             for (int retry = 0; retry <= maxFormatRetries; retry++)
             {
                 if (ct.IsCancellationRequested) return;
 
-                string prompt = retry == 0 ? enrichedPrompt
-                    : enrichedPrompt + "\n\n⚠️ 上次输出格式有误。请严格按照以下格式输出每个要修改的文件：\n\n"
-                        + "```file:完整路径\n完整文件内容\n```\n\n"
-                        + "每个文件用独立的 ```file: 代码块。不要添加额外解释。";
+                // ── 每次重试都重建消息列表（避免工具调用污染后续重试）──
+                string currentPrompt = stepPrompt;
+                if (retry > 0)
+                {
+                    currentPrompt += "\n\n⚠️ 上次输出格式有误。请严格按照以下格式输出每个要修改的文件：\n\n" +
+                        "```file:完整路径\n完整文件内容\n```\n\n" +
+                        "每个文件用独立的 ```file: 代码块。不要添加额外解释。";
+                }
+                var messages = BuildContextAwareMessages(Definition.SystemPrompt, currentPrompt);
 
-                result = await CallAiLongAsync(Definition.SystemPrompt, prompt, ct, maxTokens: 8192);
+                // ── 使用工具调用循环：AI 可以先探索再修改 ──
+                AddLog("INFO", $"[EditAgent] 调用 AI（工具循环模式，retry={retry}）...");
+                result = await CallAiWithToolLoopAsync(
+                    messages,
+                    workspaceRoot,
+                    ct,
+                    maxTokens: 8192,
+                    toolWhitelist: new List<string>(ExplorationTools));
+
                 changes = ParseCodeChangesFromResult(result);
 
                 if (changes.Count > 0) break;
-
-                // ── AI 未产出有效代码块 → 检查是否表示缺少文件 ──
-                if (retry >= maxFormatRetries) break; // 已达最大重试，不再尝试获取文件
-
-                if (DetectMissingFilesInResponse(result))
-                {
-                    var requestedFiles = ExtractRequestedFileNames(result);
-                    AddLog("INFO", $"AI 表示缺少文件，提取到 {requestedFiles.Count} 个文件引用: [{string.Join(", ", requestedFiles)}]");
-
-                    // 过滤已获取过的文件
-                    var newFiles = requestedFiles
-                        .Where(f => !fetchedFiles.Contains(f))
-                        .ToList();
-
-                    if (newFiles.Count > 0 && ExploreAgent != null && !string.IsNullOrEmpty(context.SolutionPath))
-                    {
-                        // ── 委托 ExploreAgent 搜索缺失文件 ──
-                        AddLog("INFO", $"[EditAgent] 委托 ExploreAgent 搜索缺失文件 ({newFiles.Count} 个)...");
-
-                        var foundFiles = new List<string>();
-                        foreach (var fileName in newFiles)
-                        {
-                            var discovered = await ExploreAgent.DiscoverRelevantFilesAsync(
-                                context.SolutionPath, fileName, maxFiles: 5);
-                            foundFiles.AddRange(discovered);
-                            foreach (var f in discovered)
-                                fetchedFiles.Add(f);
-                        }
-
-                        // 去重
-                        foundFiles = foundFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-
-                        if (foundFiles.Count > 0)
-                        {
-                            // ── 读取找到的文件内容，补充到 prompt ──
-                            var fileContextSb = new StringBuilder();
-                            fileContextSb.AppendLine("\n\n## 🔍 补充文件（根据 AI 请求发现）\n");
-                            int totalChars = 0;
-                            const int maxSupplementChars = 40000;
-
-                            foreach (var file in foundFiles)
-                            {
-                                if (totalChars >= maxSupplementChars) break;
-                                try
-                                {
-                                    string relativePath = GetRelativePath(context.SolutionPath!, file);
-                                    string content = await Task.Run(() => File.ReadAllText(file), ct);
-                                    int remaining = maxSupplementChars - totalChars;
-                                    if (content.Length > remaining)
-                                        content = content.Substring(0, remaining) + "\n// ... (已截断)";
-
-                                    fileContextSb.AppendLine($"### {relativePath}");
-                                    fileContextSb.AppendLine("```");
-                                    fileContextSb.AppendLine(content);
-                                    fileContextSb.AppendLine("```\n");
-                                    totalChars += content.Length + relativePath.Length + 20;
-                                }
-                                catch { /* 跳过不可读文件 */ }
-                            }
-
-                            enrichedPrompt += fileContextSb.ToString();
-                            AddLog("INFO", $"[EditAgent] 已补充 {foundFiles.Count} 个文件到上下文 ({totalChars} 字符)，重新请求 AI...");
-
-                            // ── 重置重试计数，用新上下文重新开始 ──
-                            retry = -1; // 循环末尾 +1 后变为 0
-                            continue;
-                        }
-                        else
-                        {
-                            AddLog("WARN", $"[EditAgent] ExploreAgent 未找到请求的文件: [{string.Join(", ", newFiles)}]");
-                        }
-                    }
-                    else
-                    {
-                        // ExploreAgent 不可用或没有新文件
-                        foreach (var f in requestedFiles)
-                            fetchedFiles.Add(f);
-                    }
-                }
 
                 if (retry < maxFormatRetries)
                     AddLog("WARN", $"AI 输出格式不正确（未检测到 ```file: 代码块），第 {retry + 1} 次重试...");
@@ -667,7 +610,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
         /// <summary>
         /// 执行构建/运行步骤。
-        /// 使用 IVsBuildManagerAccessor + IVsSolutionBuildManager (VS SDK Interop) 替代 EnvDTE。
+        /// 使用 IVsSolutionBuildManager (VS SDK Interop) 替代 EnvDTE。
         /// </summary>
         private async Task<string> ExecuteBuildStepAsync(AgentStep step, string? solutionPath, CancellationToken ct)
         {
@@ -675,100 +618,89 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
             await Microsoft.VisualStudio.Shell.ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
-            IVsBuildManagerAccessor? buildAccessor = null;
+            // ── 获取 IVsSolutionBuildManager（触发解决方案构建）──
+            var buildManager = (IVsSolutionBuildManager?)Microsoft.VisualStudio.Shell.ServiceProvider.GlobalProvider
+                .GetService(typeof(SVsSolutionBuildManager));
+
+            if (buildManager == null)
+            {
+                Logger.Warn("[EditAgent] 无法获取 IVsSolutionBuildManager，跳过构建");
+                return "⚠️ 无法获取构建管理器，请在 VS 中手动构建。";
+            }
+
+            // ── 检查构建管理器是否正忙 ──
+            int isBusy;
+            buildManager.QueryBuildManagerBusy(out isBusy);
+            if (isBusy != 0)
+            {
+                Logger.Warn("[EditAgent] 构建管理器正忙，跳过构建");
+                return "⚠️ 构建管理器正忙，请等待当前构建完成后重试。";
+            }
+
+            var buildEventsSink = new BuildEventsSink();
+            uint buildCookie = 0;
+            bool advised = false;
 
             try
             {
-                // ── 获取 IVsBuildManagerAccessor（管理构建状态/设计时构建）──
-                buildAccessor = (IVsBuildManagerAccessor?)Microsoft.VisualStudio.Shell.ServiceProvider.GlobalProvider
-                    .GetService(typeof(SVsBuildManagerAccessor));
+                // ── 订阅构建事件以获知构建完成 ──
+                buildManager.AdviseUpdateSolutionEvents(buildEventsSink, out buildCookie);
+                advised = true;
 
-                // ── 获取 IVsSolutionBuildManager（触发解决方案构建）──
-                var buildManager = (IVsSolutionBuildManager?)Microsoft.VisualStudio.Shell.ServiceProvider.GlobalProvider
-                    .GetService(typeof(SVsSolutionBuildManager));
+                Logger.Info("[EditAgent] 正在构建解决方案…");
 
-                if (buildManager == null)
+                // ── 启动解决方案构建 ──
+                int hr = buildManager.StartSimpleUpdateSolutionConfiguration(
+                    (uint)VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD,
+                    0,      // dwDefQueryResults
+                    0);     // fSuppressUI
+
+                if (hr < 0)
                 {
-                    Logger.Warn("[EditAgent] 无法获取 IVsSolutionBuildManager，跳过构建");
-                    return "⚠️ 无法获取构建管理器，请在 VS 中手动构建。";
+                    Logger.Warn($"[EditAgent] StartSimpleUpdateSolutionConfiguration 失败: 0x{hr:X8}");
+                    return $"⚠️ 启动构建失败 (0x{hr:X8})";
                 }
 
-                // ── 检查构建管理器是否正忙 ──
-                int isBusy;
-                buildManager.QueryBuildManagerBusy(out isBusy);
-                if (isBusy != 0)
+                // ── 等待构建完成（最长 5 分钟超时）──
+                bool completed = await buildEventsSink.WaitForCompletionAsync(ct, TimeSpan.FromMinutes(5));
+
+                if (!completed)
                 {
-                    Logger.Warn("[EditAgent] 构建管理器正忙，跳过构建");
-                    return "⚠️ 构建管理器正忙，请等待当前构建完成后重试。";
+                    Logger.Warn("[EditAgent] ⚠️ 构建超时（5 分钟），请检查解决方案状态");
+                    return "⚠️ 构建超时（5 分钟），请手动检查构建状态。可能是解决方案过大或存在循环依赖。";
                 }
 
-                // ── 标记设计时构建开始 ──
-                buildAccessor?.BeginDesignTimeBuild();
+                // ── 收集构建结果 ──
+                int buildSucceeded, buildFailed, buildCancelled;
+                buildEventsSink.GetBuildResult(out buildSucceeded, out buildFailed, out buildCancelled);
 
-                try
+                // ── 收集错误列表 ──
+                string errorDetails = CollectBuildErrors();
+
+                if (buildFailed == 0 && buildCancelled == 0)
                 {
-                    // ── 订阅构建事件以获知构建完成 ──
-                    var buildEventsSink = new BuildEventsSink();
-                    uint buildCookie;
-                    buildManager.AdviseUpdateSolutionEvents(buildEventsSink, out buildCookie);
-
-                    Logger.Info("[EditAgent] 正在构建解决方案…");
-
-                    // ── 启动解决方案构建 ──
-                    int hr = buildManager.StartSimpleUpdateSolutionConfiguration(
-                        (uint)VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD,
-                        0,      // dwDefQueryResults
-                        0);     // fSuppressUI
-
-                    if (hr < 0)
-                    {
-                        Logger.Warn($"[EditAgent] StartSimpleUpdateSolutionConfiguration 失败: 0x{hr:X8}");
-                        return $"⚠️ 启动构建失败 (0x{hr:X8})";
-                    }
-
-                    // ── 等待构建完成 ──
-                    await buildEventsSink.WaitForCompletionAsync(ct);
-
-                    // ── 取消订阅事件 ──
-                    buildManager.UnadviseUpdateSolutionEvents(buildCookie);
-
-                    // ── 收集构建结果 ──
-                    int buildSucceeded, buildFailed, buildCancelled;
-                    buildEventsSink.GetBuildResult(out buildSucceeded, out buildFailed, out buildCancelled);
-
-                    // ── 收集错误列表 ──
-                    string errorDetails = CollectBuildErrors();
-
-                    if (buildFailed == 0 && buildCancelled == 0)
-                    {
-                        Logger.Info($"[EditAgent] ✅ 构建成功 ({buildSucceeded} 个项目)");
-                        return $"✅ 构建成功，{buildSucceeded} 个项目通过";
-                    }
-
-                    if (buildCancelled != 0)
-                    {
-                        Logger.Info("[EditAgent] ⚠️ 构建已取消");
-                        return "⚠️ 构建已取消";
-                    }
-
-                    var result = new StringBuilder();
-                    result.AppendLine($"⚠️ 构建完成，{buildFailed} 个项目失败");
-                    if (!string.IsNullOrEmpty(errorDetails))
-                    {
-                        result.AppendLine();
-                        result.AppendLine("## 编译错误详情");
-                        result.Append(errorDetails);
-                    }
-
-                    string fullResult = result.ToString();
-                    Logger.Info($"[EditAgent] {fullResult.Truncate(500)}");
-                    return fullResult;
+                    Logger.Info($"[EditAgent] ✅ 构建成功 ({buildSucceeded} 个项目)");
+                    return $"✅ 构建成功，{buildSucceeded} 个项目通过";
                 }
-                finally
+
+                if (buildCancelled != 0)
                 {
-                    // ── 标记设计时构建结束 ──
-                    buildAccessor?.EndDesignTimeBuild();
+                    Logger.Info("[EditAgent] ⚠️ 构建已取消");
+                    return "⚠️ 构建已取消";
                 }
+
+                var result = new StringBuilder();
+                result.AppendLine($"⚠️ 构建完成，{buildFailed} 个项目失败");
+                if (!string.IsNullOrEmpty(errorDetails))
+                {
+                    result.AppendLine();
+                    result.AppendLine("## 编译错误详情");
+                    result.Append(errorDetails);
+                }
+
+                string fullResult = result.ToString();
+                Logger.Info($"[EditAgent] {fullResult.Truncate(500)}");
+                return fullResult;
             }
             catch (OperationCanceledException)
             {
@@ -779,6 +711,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             {
                 Logger.Warn($"[EditAgent] 构建异常: {ex.Message}");
                 return $"⚠️ 构建失败: {ex.Message}";
+            }
+            finally
+            {
+                // ── 确保取消订阅事件 ──
+                if (advised && buildCookie != 0)
+                {
+                    try { buildManager.UnadviseUpdateSolutionEvents(buildCookie); } catch { }
+                }
+                buildEventsSink.Dispose();
             }
         }
 
@@ -945,18 +886,38 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// <summary>
         /// 构建事件接收器，实现 IVsUpdateSolutionEvents 以监听构建开始/完成/取消。
         /// 通过 TaskCompletionSource 将事件驱动的回调转换为可等待的 Task。
+        /// 内置超时保护，防止因构建事件丢失而永久挂起。
         /// </summary>
-        private sealed class BuildEventsSink : IVsUpdateSolutionEvents
+        private sealed class BuildEventsSink : IVsUpdateSolutionEvents, IDisposable
         {
             private readonly TaskCompletionSource<bool> _tcs = new();
+            private CancellationTokenRegistration _ctRegistration;
             private int _succeeded;
             private int _failed;
             private int _cancelled;
+            private bool _disposed;
 
-            public Task WaitForCompletionAsync(CancellationToken ct)
+            /// <summary>
+            /// 等待构建完成或超时。
+            /// </summary>
+            /// <returns>true 表示构建事件正常触发；false 表示超时</returns>
+            public async Task<bool> WaitForCompletionAsync(CancellationToken ct, TimeSpan timeout)
             {
-                ct.Register(() => _tcs.TrySetCanceled());
-                return _tcs.Task;
+                _ctRegistration = ct.Register(() => _tcs.TrySetCanceled());
+                try
+                {
+                    var completedTask = await Task.WhenAny(_tcs.Task, Task.Delay(timeout, ct)).ConfigureAwait(false);
+                    if (completedTask == _tcs.Task)
+                    {
+                        await completedTask.ConfigureAwait(false); // 传播异常（如有）
+                        return true;
+                    }
+                    return false; // 超时
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
             }
 
             public void GetBuildResult(out int succeeded, out int failed, out int cancelled)
@@ -1008,6 +969,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             public int OnActiveProjectCfgChange(IVsHierarchy pIVsHierarchy)
             {
                 return VSConstants.S_OK;
+            }
+
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _ctRegistration.Dispose();
+                _tcs.TrySetResult(false);
             }
         }
 

@@ -324,6 +324,67 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 AddLog("ERROR", $"[Discover] 文件发现失败: {ex.Message}");
             }
 
+            // ── 回退：CMake / Open Folder 项目中 DTE ProjectItems 可能为空 ──
+            // 使用目录扫描作为兜底方案，确保非 .sln 项目也能发现文件
+            if (discoveredFiles.Count == 0 && !string.IsNullOrEmpty(solutionPath))
+            {
+                try
+                {
+                    string workspaceDir = solutionPath;
+                    if (System.IO.File.Exists(workspaceDir))
+                        workspaceDir = System.IO.Path.GetDirectoryName(workspaceDir) ?? workspaceDir;
+
+                    if (System.IO.Directory.Exists(workspaceDir))
+                    {
+                        AddLog("INFO", $"[Discover] DTE 未发现文件，回退到目录扫描: {workspaceDir}");
+
+                        var excludeDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            "bin", "obj", ".git", ".vs", "node_modules", "packages",
+                            "Debug", "Release", "out", ".github",
+                        };
+
+                        await Task.Run(() =>
+                        {
+                            try
+                            {
+                                var allFiles = System.IO.Directory.GetFiles(workspaceDir, "*.*", System.IO.SearchOption.AllDirectories);
+                                foreach (var file in allFiles)
+                                {
+                                    if (discoveredFiles.Count >= maxFiles) break;
+
+                                    string dir = System.IO.Path.GetDirectoryName(file) ?? "";
+                                    bool excluded = false;
+                                    foreach (var excludeDir in excludeDirs)
+                                    {
+                                        if (dir.IndexOf(excludeDir, StringComparison.OrdinalIgnoreCase) >= 0)
+                                        {
+                                            excluded = true;
+                                            break;
+                                        }
+                                    }
+                                    if (excluded) continue;
+
+                                    string ext = System.IO.Path.GetExtension(file);
+                                    if (SourceFileExtensions.Contains(ext))
+                                        discoveredFiles.Add(file);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                AddLog("WARN", $"[Discover] 目录扫描回退失败: {ex.Message}");
+                            }
+                        });
+
+                        AddLog("INFO", $"[Discover] 目录扫描回退完成: {discoveredFiles.Count} 个文件");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AddLog("WARN", $"[Discover] 目录扫描回退异常: {ex.Message}");
+                }
+            }
+
             return discoveredFiles;
         }
 

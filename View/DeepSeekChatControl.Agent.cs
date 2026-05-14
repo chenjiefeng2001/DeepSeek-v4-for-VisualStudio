@@ -147,12 +147,14 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 _agentStreamingMsgIndex = -1;
                 _lastReportedStepIndex = 0;
                 _lastReportedStepStatus = string.Empty;
+                _pendingHandoff = null;
 
                 var context = new AgentContext
                 {
                     SolutionPath = _solutionPath,
                     FileContext = fileContext,
                     ConversationHistory = _contextManager.GetConversationHistory(),
+                    ContextManager = _contextManager,
                     IsPlanningMode = routing?.NeedsPlanning == true || routing?.TargetAgent == AgentType.Plan,
                     ReadFileAsync = async (path) =>
                     {
@@ -263,6 +265,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         _agentDispatcher.FileChangeNotified -= OnAgentFileChangeNotified;
                     }
                 }
+                else if (agentResult.Handoff != null && agentResult.Handoff.ShowContinueOn)
+                {
+                    // ── 非自动 Handoff：保存引用，稍后在渲染完成后注入"开始实现"按钮 ──
+                    _pendingHandoff = agentResult.Handoff;
+                }
 
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
@@ -344,8 +351,18 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     // ── 最终渲染用 Markdown → HTML（执行过程作为独立 HTML 注入，不经过 Markdown）──
                     try
                     {
+                        // 追加 Cache 命中率统计
+                        string cacheFooter = string.Empty;
+                        var usage = _apiService?.LastUsage;
+                        if (usage != null)
+                        {
+                            cacheFooter = ChatHtmlService.BuildCacheHitFooterHtml(
+                                usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
+                                usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                        }
+                        string combinedFooter = thinkingDetailsHtml + cacheFooter;
                         string finalRenderJs = ChatHtmlService.BuildFinalRenderJs(
-                            _agentStreamingMsgIndex, finalContent, string.Empty, thinkingDetailsHtml);
+                            _agentStreamingMsgIndex, finalContent, string.Empty, combinedFooter);
                         await ChatWebView.CoreWebView2.ExecuteScriptAsync(finalRenderJs);
                     }
                     catch { }
@@ -355,6 +372,19 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         : plan.ChangedFiles.Count > 0
                             ? $"✅ Agent 任务完成 ({plan.ChangedFiles.Count} 个文件变更)"
                             : $"✅ Agent 计划完成 ({plan.Steps.Count} 个步骤)";
+
+                    // ── 如果有待处理的 Handoff（如 Plan→Edit），注入"开始实现"按钮 ──
+                    if (_pendingHandoff != null && _agentStreamingMsgIndex >= 0)
+                    {
+                        try
+                        {
+                            string targetAgentStr = _pendingHandoff.TargetAgent.ToString();
+                            string handoffBtnJs = ChatHtmlService.BuildHandoffButtonJs(
+                                _agentStreamingMsgIndex, targetAgentStr, _pendingHandoff.Label);
+                            await ChatWebView.CoreWebView2.ExecuteScriptAsync(handoffBtnJs);
+                        }
+                        catch { }
+                    }
 
                     if (plan.ChangedFiles.Count > 0)
                     {
@@ -377,12 +407,33 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     await UpdateStreamingMessageAsync(_agentStreamingMsgIndex, agentResult.Content, string.Empty, isComplete: true);
                     try
                     {
+                        string cacheFooter = string.Empty;
+                        var usage = _apiService?.LastUsage;
+                        if (usage != null)
+                        {
+                            cacheFooter = ChatHtmlService.BuildCacheHitFooterHtml(
+                                usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
+                                usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                        }
                         string frJs = ChatHtmlService.BuildFinalRenderJs(
-                            _agentStreamingMsgIndex, agentResult.Content, string.Empty);
+                            _agentStreamingMsgIndex, agentResult.Content, string.Empty, cacheFooter);
                         await ChatWebView.CoreWebView2.ExecuteScriptAsync(frJs);
                     }
                     catch { }
                     StatusLabel.Text = "就绪";
+
+                    // ── 如果有待处理的 Handoff，注入按钮 ──
+                    if (_pendingHandoff != null && _agentStreamingMsgIndex >= 0)
+                    {
+                        try
+                        {
+                            string targetAgentStr = _pendingHandoff.TargetAgent.ToString();
+                            string handoffBtnJs = ChatHtmlService.BuildHandoffButtonJs(
+                                _agentStreamingMsgIndex, targetAgentStr, _pendingHandoff.Label);
+                            await ChatWebView.CoreWebView2.ExecuteScriptAsync(handoffBtnJs);
+                        }
+                        catch { }
+                    }
                 }
                 else if (!agentResult.Success)
                 {
@@ -400,8 +451,16 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     await UpdateStreamingMessageAsync(_agentStreamingMsgIndex, errorContent, string.Empty, isComplete: true);
                     try
                     {
+                        string cacheFooter = string.Empty;
+                        var usage = _apiService?.LastUsage;
+                        if (usage != null)
+                        {
+                            cacheFooter = ChatHtmlService.BuildCacheHitFooterHtml(
+                                usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
+                                usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                        }
                         string frJs = ChatHtmlService.BuildFinalRenderJs(
-                            _agentStreamingMsgIndex, errorContent, string.Empty);
+                            _agentStreamingMsgIndex, errorContent, string.Empty, cacheFooter);
                         await ChatWebView.CoreWebView2.ExecuteScriptAsync(frJs);
                     }
                     catch { }
@@ -764,6 +823,105 @@ namespace DeepSeek_v4_for_VisualStudio.View
             if (changes != null && changes.Count > 0)
             {
                 RecordFileChangesForTurn(userMsgIndex, changes);
+            }
+        }
+
+        /// <summary>
+        /// 执行 Agent Handoff（从 Plan → Edit）。
+        /// 由 WebView 中的"▶ 开始实现"按钮触发。
+        /// </summary>
+        /// <param name="targetAgent">目标 Agent 类型字符串（如 "Edit"）</param>
+        /// <param name="label">按钮标签（用于日志）</param>
+        private async Task ExecuteAgentHandoffAsync(string targetAgent, string label)
+        {
+            if (_agentDispatcher == null || _pendingHandoff == null) return;
+
+            try
+            {
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                StatusLabel.Text = $"🤖 切换到 {targetAgent} Agent — 正在执行计划...";
+
+                // ── 隐藏 handoff 按钮（防止重复点击）──
+                if (ChatWebView.CoreWebView2 != null)
+                {
+                    try
+                    {
+                        await ChatWebView.CoreWebView2.ExecuteScriptAsync(
+                            "var btns=document.querySelectorAll('.handoff-btn');btns.forEach(function(b){b.disabled=true;b.textContent='⏳ 执行中...';b.style.opacity='0.6';});");
+                    }
+                    catch { }
+                }
+
+                await TaskScheduler.Default;
+
+                // ── 构建包含 _pendingHandoff 上下文的 AgentContext ──
+                var context = new AgentContext
+                {
+                    SolutionPath = _solutionPath,
+                    ContextManager = _contextManager,
+                    IsPlanningMode = true,
+                    ReadFileAsync = async (path) =>
+                    {
+                        if (File.Exists(path))
+                            return await Task.Run(() => File.ReadAllText(path));
+                        return null;
+                    },
+                };
+
+                var editAgent = _agentDispatcher.EditAgent;
+                editAgent.PlanUpdated += OnAgentPlanUpdated;
+                _agentDispatcher.PlanUpdated += OnAgentDispatcherPlanUpdated;
+                _agentDispatcher.LogEntryAdded += OnAgentLogEntryAdded;
+                _agentDispatcher.FileChangeNotified += OnAgentFileChangeNotified;
+
+                AgentResult agentResult;
+                try
+                {
+                    agentResult = await _agentDispatcher.ExecuteHandoffAsync(_pendingHandoff, context);
+                }
+                finally
+                {
+                    editAgent.PlanUpdated -= OnAgentPlanUpdated;
+                    _agentDispatcher.PlanUpdated -= OnAgentDispatcherPlanUpdated;
+                    _agentDispatcher.LogEntryAdded -= OnAgentLogEntryAdded;
+                    _agentDispatcher.FileChangeNotified -= OnAgentFileChangeNotified;
+                }
+
+                _pendingHandoff = null; // 消费后清空
+
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                if (agentResult.Success && agentResult.Plan != null)
+                {
+                    var plan = agentResult.Plan;
+                    if (plan.Steps.Count > 0)
+                    {
+                        try
+                        {
+                            string completeJs = ChatHtmlService.BuildAgentTaskPanelCompleteJs(plan);
+                            await ChatWebView.CoreWebView2.ExecuteScriptAsync(completeJs);
+                        }
+                        catch { }
+                    }
+
+                    string finalContent = agentResult.Content ?? $"✅ 任务完成 — {plan.Steps.Count(s => s.Status == AgentStepStatus.Completed)}/{plan.Steps.Count} 步成功";
+                    StatusLabel.Text = plan.ChangedFiles.Count > 0
+                        ? $"✅ Agent 任务完成 ({plan.ChangedFiles.Count} 个文件变更)"
+                        : "✅ 计划执行完成";
+
+                    if (plan.ChangedFiles.Count > 0)
+                        _pendingAgentFileChanges = new List<FileChangeSummary>(plan.ChangedFiles);
+                }
+                else
+                {
+                    StatusLabel.Text = "就绪";
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[AgentHandoff] 执行失败: {ex.Message}", ex);
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                StatusLabel.Text = $"❌ Handoff 错误: {ex.Message}";
             }
         }
 
@@ -1536,8 +1694,20 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 // ── 记录 Cache 命中率 ──
                 LogCacheHitRate();
 
+                // ── 构建 Cache 命中率统计卡片 HTML ──
+                string cacheFooterHtml = string.Empty;
+                {
+                    var usage = _apiService?.LastUsage;
+                    if (usage != null)
+                    {
+                        cacheFooterHtml = ChatHtmlService.BuildCacheHitFooterHtml(
+                            usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
+                            usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                    }
+                }
+
                 string finalJs = ChatHtmlService.BuildFinalRenderJs(
-                    newAssistantIdx, contentBuffer.ToString(), reasoningBuffer.ToString());
+                    newAssistantIdx, contentBuffer.ToString(), reasoningBuffer.ToString(), cacheFooterHtml);
                 await ChatWebView.CoreWebView2.ExecuteScriptAsync(finalJs);
 
                 _contextManager.AddAssistantMessage(

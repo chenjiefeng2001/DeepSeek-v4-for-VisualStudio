@@ -1605,6 +1605,14 @@ namespace DeepSeek_v4_for_VisualStudio.View
                             }
                         });
                     }
+                    else if (type == "executeHandoff")
+                    {
+                        string targetAgent = obj.TryGetProperty("targetAgent", out var targetProp)
+                            ? targetProp.GetString() ?? "Edit" : "Edit";
+                        string label = obj.TryGetProperty("label", out var labelProp)
+                            ? labelProp.GetString() ?? "开始实现" : "开始实现";
+                        _ = ExecuteAgentHandoffAsync(targetAgent, label);
+                    }
                 }
             }
             catch (Exception ex)

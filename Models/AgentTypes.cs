@@ -132,6 +132,10 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         /// <summary>会话历史消息</summary>
         public List<ChatApiMessage> ConversationHistory { get; set; } = new();
 
+        /// <summary>会话上下文管理器引用（用于 Agent 内部构建带历史的 API 消息，优化缓存命中率）</summary>
+        [JsonIgnore]
+        public Services.ConversationContextManager? ContextManager { get; set; }
+
         /// <summary>文件读取回调</summary>
         [JsonIgnore]
         public Func<string, Task<string?>>? ReadFileAsync { get; set; }

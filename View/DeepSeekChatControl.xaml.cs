@@ -164,6 +164,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
         // ── 最近一次 Agent 执行的文件变更（临时存储，RunAgentWorkflowAsync 写入，RecordAgentFileChanges 消费后清空）──
         private List<Models.FileChangeSummary>? _pendingAgentFileChanges;
 
+        /// <summary>最近一次 Agent 执行的 Handoff（用于 UI 渲染"开始实现"按钮）</summary>
+        private Models.AgentHandoff? _pendingHandoff;
+
         // ── Agent 流式日志面板 ID（会话级，不依赖 PlanId）──
         private string _agentLogPanelId = "session";
 
@@ -292,6 +295,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
             _builtInToolService = new BuiltInToolService(_mcpManager, _webSearchService);
 
             _agentDispatcher = new AgentDispatcher(_apiService, _builtInToolService, _mcpManager);
+            _agentDispatcher.ContextManager = _contextManager;
             _agentDispatcher.PermissionRequested += OnAgentPermissionRequested;
             Logger.Info("Agent 调度器初始化成功（多 Agent 模式：Ask / Plan / Explore / Edit）");
 

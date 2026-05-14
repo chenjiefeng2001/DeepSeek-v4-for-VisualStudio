@@ -75,11 +75,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// </summary>
         public async Task<string> CallAiShortAsync(string systemPrompt, string userPrompt, CancellationToken ct, int maxTokens = 512)
         {
-            var messages = new List<ChatApiMessage>
-            {
-                new ChatApiMessage { Role = "system", Content = systemPrompt },
-                new ChatApiMessage { Role = "user", Content = userPrompt }
-            };
+            var messages = BuildContextAwareMessages(systemPrompt, userPrompt);
 
             var sb = new StringBuilder();
             await foreach (var chunk in _apiService.ChatStreamAsync(messages, null, ct))
@@ -96,11 +92,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// </summary>
         protected async Task<string> CallAiLongAsync(string systemPrompt, string userPrompt, CancellationToken ct, int maxTokens = 4096)
         {
-            var messages = new List<ChatApiMessage>
-            {
-                new ChatApiMessage { Role = "system", Content = systemPrompt },
-                new ChatApiMessage { Role = "user", Content = userPrompt }
-            };
+            var messages = BuildContextAwareMessages(systemPrompt, userPrompt);
 
             var sb = new StringBuilder();
             await foreach (var chunk in _apiService.ChatStreamAsync(messages, null, ct))
@@ -145,6 +137,72 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         }
 
         /// <summary>
+        /// 构建上下文感知的消息列表，将 Agent 的 system prompt 与对话历史合并。
+        /// 
+        /// 消息顺序已针对 DeepSeek Prompt Cache 优化：
+        /// 1. Agent 的 System Prompt（稳定，每次相同）→ 形成可缓存前缀
+        /// 2. 对话历史摘要 / 压缩上下文（相对稳定）→ 延长可缓存前缀
+        /// 3. 当前用户消息（变化最大）→ 缓存前缀到此为止
+        /// 
+        /// 缓存命中策略：
+        /// - 同一 Agent 类型多次调用时，system prompt 前缀命中缓存
+        /// - 同一会话内多轮调用时，system + 历史前缀命中缓存
+        /// - 大幅降低重复上下文的 token 计费
+        /// </summary>
+        /// <param name="systemPrompt">Agent 的系统提示词</param>
+        /// <param name="userPrompt">当前的用户消息/步骤描述</param>
+        /// <param name="maxRecentTurns">注入对话历史的最近轮次数（0 = 不注入）</param>
+        /// <returns>按缓存优化顺序排列的消息列表</returns>
+        protected List<ChatApiMessage> BuildContextAwareMessages(
+            string systemPrompt, string userPrompt, int maxRecentTurns = 5)
+        {
+            var messages = new List<ChatApiMessage>();
+
+            // ── 第1层：Agent System Prompt（最稳定，始终在最前面确保缓存命中）──
+            messages.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
+
+            // ── 第2层：对话历史（来自 ConversationContextManager，相对稳定）──
+            // 使用 ContextManager 注入历史，而非 Context.ConversationHistory（后者不含 tool 消息和 reasoning 规则）
+            var ctxManager = Context?.ContextManager;
+            if (ctxManager != null && !ctxManager.IsEmpty && maxRecentTurns > 0)
+            {
+                // 注入压缩摘要（早期对话的精简版本）
+                if (ctxManager.Compressor != null)
+                {
+                    string compressedText = ctxManager.Compressor.GetCompressedContextText();
+                    if (!string.IsNullOrWhiteSpace(compressedText))
+                        messages.Add(new ChatApiMessage { Role = "system", Content = compressedText });
+                }
+
+                // 注入最近 N 轮的原始消息（保留 tool 调用链完整性）
+                var recentMessages = ctxManager.BuildApiMessagesRecentTurns(maxRecentTurns);
+                if (recentMessages.Count > 0)
+                {
+                    // 跳过第一条 system 消息（Agent 已有自己的 system prompt），
+                    // 但保留压缩摘要和搜索/RAG 上下文等 system 消息
+                    bool firstSystemSkipped = false;
+                    foreach (var msg in recentMessages)
+                    {
+                        if (msg.Role == "system")
+                        {
+                            if (!firstSystemSkipped)
+                            {
+                                firstSystemSkipped = true;
+                                continue; // 跳过对话管理器的 system prompt
+                            }
+                        }
+                        messages.Add(msg);
+                    }
+                }
+            }
+
+            // ── 第3层：当前用户消息（变化最大，放在最后）──
+            messages.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+
+            return messages;
+        }
+
+        /// <summary>
         /// 带工具调用的 AI 对话循环（支持多轮工具调用）。
         /// 
         /// 这是 Agent 执行工具增强型任务的核心方法。
@@ -155,6 +213,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// <param name="ct">取消令牌</param>
         /// <param name="maxTokens">最大 token 数</param>
         /// <param name="maxToolRounds">【已废弃】使用智能循环检测替代。保留参数兼容性，但不再使用。</param>
+        /// <param name="toolWhitelist">自定义工具白名单（null = 使用 Definition.AllowedTools）</param>
         /// <param name="onThinking">思考内容回调（用于 UI 实时更新）</param>
         /// <param name="onContent">内容回调（用于 UI 实时更新）</param>
         /// <param name="onToolCall">工具调用回调（用于 UI 通知）</param>
@@ -165,6 +224,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             CancellationToken ct,
             int maxTokens = 4096,
             int maxToolRounds = 30,
+            List<string>? toolWhitelist = null,
             Action<string>? onThinking = null,
             Action<string>? onContent = null,
             Action<string>? onToolCall = null)
@@ -202,21 +262,25 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 {
                     toolDefs = new List<ToolDefinition>();
 
+                    // 使用自定义白名单或默认 Definition.AllowedTools
+                    var effectiveWhitelist = toolWhitelist ?? Definition.AllowedTools;
+
                     // 内置工具
                     if (BuiltInTools != null)
                     {
-                        var builtInDefs = BuiltInTools.GetFilteredToolDefinitions(Definition.AllowedTools);
+                        var builtInDefs = BuiltInTools.GetFilteredToolDefinitions(effectiveWhitelist);
                         toolDefs.AddRange(builtInDefs);
                     }
 
                     // MCP 外部工具
                     if (McpManager != null && McpManager.AllTools.Count > 0)
                     {
-                        var mcpDefs = McpManager.GetFilteredToolDefinitions(Definition.AllowedTools);
+                        var mcpDefs = McpManager.GetFilteredToolDefinitions(effectiveWhitelist);
                         toolDefs.AddRange(mcpDefs);
                     }
 
-                    Logger.Info($"[Agent:{Definition.Name}] 本轮携带 {toolDefs.Count} 个工具定义");
+                    Logger.Info($"[Agent:{Definition.Name}] 本轮携带 {toolDefs.Count} 个工具定义" +
+                        (toolWhitelist != null ? " (自定义白名单)" : ""));
                 }
 
                 // ── 流式调用 AI ──

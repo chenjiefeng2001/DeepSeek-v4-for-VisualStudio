@@ -114,6 +114,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         public AgentType ActiveAgentType { get; private set; } = AgentType.Ask;
 
         /// <summary>
+        /// 会话上下文管理器引用（由 DeepSeekChatControl 注入），
+        /// 用于在 Agent 执行时注入对话历史以优化缓存命中率。
+        /// </summary>
+        public ConversationContextManager? ContextManager { get; set; }
+
+        /// <summary>
         /// 获取当前活跃 Agent 允许使用的工具名称列表。
         /// 用于过滤 MCP 工具定义，确保 Agent 只能调用其声明 whitelist 中的工具。
         /// </summary>
@@ -395,6 +401,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             var routing = routingOverride ?? await RouteAsync(userMessage, context.CancellationToken);
             ActiveAgentType = routing.TargetAgent;
 
+            // ── 注入 ContextManager 到 AgentContext（供 Agent 内部构建上下文感知消息）──
+            if (context.ContextManager == null)
+                context.ContextManager = ContextManager;
+
             Logger.Info($"[AgentDispatcher] 路由到 {routing.TargetAgent} Agent "
                 + $"(原因: {routing.Reason}, 需要规划: {routing.NeedsPlanning})");
 
@@ -403,6 +413,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             if (routing.NeedsPlanning || routing.TargetAgent == AgentType.Plan)
             {
                 var planAgent = (PlanAgent)EnsureAgent(AgentType.Plan);
+                planAgent.Context = context;
                 ActiveAgentType = AgentType.Plan;
 
                 Logger.Info("[AgentDispatcher] 启动 Plan Agent...");
@@ -434,12 +445,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             {
                 case AgentType.Ask:
                     var askAgent = (AskAgent)EnsureAgent(AgentType.Ask);
+                    askAgent.Context = context;
                     ActiveAgentType = AgentType.Ask;
                     result = await askAgent.ExecuteAsync(userMessage, context);
                     break;
 
                 case AgentType.Edit:
                     var editAgent = (EditAgent)EnsureAgent(AgentType.Edit);
+                    editAgent.Context = context;
                     ActiveAgentType = AgentType.Edit;
 
                     // 如果有计划，注入到上下文
@@ -453,12 +466,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
                 case AgentType.Explore:
                     var exploreAgent = (ExploreAgent)EnsureAgent(AgentType.Explore);
+                    exploreAgent.Context = context;
                     ActiveAgentType = AgentType.Explore;
                     result = await exploreAgent.ExecuteAsync(userMessage, context);
                     break;
 
                 default:
                     var defaultAgent = (AskAgent)EnsureAgent(AgentType.Ask);
+                    defaultAgent.Context = context;
                     ActiveAgentType = AgentType.Ask;
                     result = await defaultAgent.ExecuteAsync(userMessage, context);
                     break;
@@ -477,15 +492,53 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
             ActiveAgentType = handoff.TargetAgent;
             var agent = EnsureAgent(handoff.TargetAgent);
+            agent.Context = context;
 
-            // 构建 Handoff prompt（包含原计划信息）
-            string handoffMessage = handoff.Prompt;
+            // ── 构建 Handoff prompt（包含完整计划上下文）──
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine(handoff.Prompt);
+
             if (ActivePlan != null)
             {
-                handoffMessage += $"\n\n计划: {ActivePlan.Title}\n步骤数: {ActivePlan.Steps.Count}";
+                sb.AppendLine();
+                sb.AppendLine($"## 任务计划: {ActivePlan.Title}");
+                sb.AppendLine($"共 {ActivePlan.Steps.Count} 个步骤：");
+                sb.AppendLine();
+
+                foreach (var s in ActivePlan.Steps)
+                {
+                    sb.AppendLine($"### 步骤 {s.Index}: {s.Title}");
+                    sb.AppendLine(s.Description);
+                    sb.AppendLine();
+                }
             }
 
+            // ── 注入 plan.md 内容（如果存在）──
+            string? planFilePath = context.PlanFilePath ?? ActivePlan?.PlanFilePath;
+            if (!string.IsNullOrEmpty(planFilePath) && System.IO.File.Exists(planFilePath))
+            {
+                try
+                {
+                    string planMd = await Task.Run(() => System.IO.File.ReadAllText(planFilePath));
+                    if (planMd.Length > 0)
+                    {
+                        sb.AppendLine("## 📄 详细计划文档 (plan.md)");
+                        // 截断过长内容，保留前 8000 字符
+                        if (planMd.Length > 8000)
+                            planMd = planMd.Substring(0, 8000) + "\n\n... (计划文档过长，已截断)";
+                        sb.AppendLine(planMd);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"[AgentDispatcher] 读取 plan.md 失败: {ex.Message}");
+                }
+            }
+
+            string handoffMessage = sb.ToString();
             context.ActivePlan = ActivePlan;
+            context.IsPlanningMode = true; // Handoff 后进入 Planning 模式执行
+
             return await agent.ExecuteAsync(handoffMessage, context);
         }
 

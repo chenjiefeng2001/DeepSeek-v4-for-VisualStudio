@@ -221,6 +221,22 @@ img{max-width:100%}
 .inline-edit-btn-save:hover{background:#2A5A2A;color:#7EFFC0}
 .inline-edit-btn-cancel{background:#3C3C3C;color:#CCC;border:1px solid #555}
 .inline-edit-btn-cancel:hover{background:#4A4A4A;color:#FFF}
+/* ── Cache 命中率统计卡片 ── */
+.cache-stat-card{display:flex;align-items:center;gap:10px;margin-top:10px;padding:8px 12px;border-radius:6px;font-size:11px;font-family:'Segoe UI',system-ui,sans-serif;flex-wrap:wrap;border:1px solid #333;background:#252526}
+.cache-stat-card .cache-icon{font-size:15px;flex-shrink:0}
+.cache-stat-card .cache-main{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0}
+.cache-stat-card .cache-rate{font-size:15px;font-weight:700;flex-shrink:0}
+.cache-stat-card .cache-rate.high{color:#4EC9B0}
+.cache-stat-card .cache-rate.medium{color:#C8A84E}
+.cache-stat-card .cache-rate.low{color:#E07878}
+.cache-stat-card .cache-detail{color:#888;line-height:1.5}
+.cache-stat-card .cache-detail span{color:#AAA;font-weight:600}
+.cache-stat-card .cache-bar-wrap{width:80px;height:4px;background:#3C3C3C;border-radius:2px;overflow:hidden;flex-shrink:0}
+.cache-stat-card .cache-bar-fill{height:100%;border-radius:2px;transition:width .5s ease}
+.cache-stat-card .cache-bar-fill.high{background:linear-gradient(90deg,#4EC9B0,#3A8A7A)}
+.cache-stat-card .cache-bar-fill.medium{background:linear-gradient(90deg,#C8A84E,#8A7A3A)}
+.cache-stat-card .cache-bar-fill.low{background:linear-gradient(90deg,#E07878,#8A3A3A)}
+.cache-stat-card .cache-saved{color:#666;font-size:10px;white-space:nowrap}
 ";
 
 private const string AiAvatarHtml = "<span class='avatar avatar-ai'>AI</span>";

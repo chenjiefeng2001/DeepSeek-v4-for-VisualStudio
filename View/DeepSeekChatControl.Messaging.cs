@@ -777,7 +777,13 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
                     Logger.Info($"[Render] 流式结束: 内容={contentBuffer.Length}, 思考={reasoningBuffer.Length}");
 
-                    string finalJs = ChatHtmlService.BuildFinalRenderJs(assistantMsgIndex, contentBuffer.ToString(), reasoningBuffer.ToString());
+                    // ── 构建 Cache 命中率统计卡片 HTML ──
+                    string cacheFooterHtml = ChatHtmlService.BuildCacheHitFooterHtml(
+                        totalCacheHitTokens, totalCacheMissTokens,
+                        totalPromptTokens, totalCompletionTokens, round);
+
+                    string finalJs = ChatHtmlService.BuildFinalRenderJs(
+                        assistantMsgIndex, contentBuffer.ToString(), reasoningBuffer.ToString(), cacheFooterHtml);
                     await ChatWebView.CoreWebView2.ExecuteScriptAsync(finalJs);
 
                     if (capturedSearchResults.Count > 0)
