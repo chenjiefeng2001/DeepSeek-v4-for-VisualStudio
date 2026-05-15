@@ -351,14 +351,16 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     // ── 最终渲染用 Markdown → HTML（执行过程作为独立 HTML 注入，不经过 Markdown）──
                     try
                     {
-                        // 追加 Cache 命中率统计
+                        // 追加 Cache 命中率统计（使用累计值，非单轮）
                         string cacheFooter = string.Empty;
-                        var usage = _apiService?.LastUsage;
-                        if (usage != null)
+                        long totalHit = _apiService?.TotalCacheHitTokens ?? 0;
+                        long totalMiss = _apiService?.TotalCacheMissTokens ?? 0;
+                        long totalPrompt = _apiService?.TotalPromptTokens ?? 0;
+                        long totalComp = _apiService?.TotalCompletionTokens ?? 0;
+                        if (totalHit + totalMiss > 0)
                         {
                             cacheFooter = ChatHtmlService.BuildCacheHitFooterHtml(
-                                usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
-                                usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                                totalHit, totalMiss, totalPrompt, totalComp, roundCount: 1);
                         }
                         string combinedFooter = thinkingDetailsHtml + cacheFooter;
                         string finalRenderJs = ChatHtmlService.BuildFinalRenderJs(
@@ -485,6 +487,32 @@ namespace DeepSeek_v4_for_VisualStudio.View
             // ── 将 Agent 响应同步到树和上下文管理器（修复上下文丢失问题）──
             await SyncAgentResponseToTreeAndContextAsync();
 
+            // ── AI 自动生成会话标题（Agent 工作流完成后触发）──
+            if (_pendingAiTitle && !string.IsNullOrWhiteSpace(_firstUserMessageForTitle))
+            {
+                var capturedFirstUserMsg = _firstUserMessageForTitle;
+                // 从 Agent 响应消息中获取第一条助手回复作为标题生成的上下文
+                string firstAssistantReply = string.Empty;
+                lock (_lock)
+                {
+                    if (_agentStreamingMsgIndex >= 0 && _agentStreamingMsgIndex < _messages.Count)
+                    {
+                        firstAssistantReply = _messages[_agentStreamingMsgIndex].Content ?? string.Empty;
+                    }
+                }
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await GenerateAiTitleAsync(capturedFirstUserMsg, firstAssistantReply);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[AI标题] Agent 工作流标题生成异常: {ex.Message}");
+                    }
+                });
+            }
+
             // ── 记录 Cache 命中率 ──
             LogCacheHitRate();
         }
@@ -503,7 +531,10 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 lock (_lock)
                 {
                     if (_agentStreamingMsgIndex < 0 || _agentStreamingMsgIndex >= _messages.Count)
+                    {
+                        Logger.Warn($"[Agent→Tree] 无效的 _agentStreamingMsgIndex={_agentStreamingMsgIndex}, _messages.Count={_messages.Count}");
                         return;
+                    }
 
                     var agentResponseMsg = _messages[_agentStreamingMsgIndex];
 
@@ -515,7 +546,15 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     if (_tree != null && string.IsNullOrEmpty(agentResponseMsg.NodeId))
                     {
                         _tree.AddChildMessage(agentResponseMsg);
-                        Logger.Info($"[Agent→Tree] Agent 响应已添加到树 (nodeId={agentResponseMsg.NodeId})");
+                        Logger.Info($"[Agent→Tree] Agent 响应已添加到树 (nodeId={agentResponseMsg.NodeId}, role={agentResponseMsg.Role})");
+                    }
+                    else if (_tree == null)
+                    {
+                        Logger.Warn("[Agent→Tree] _tree 为 null，无法将 Agent 响应添加到树");
+                    }
+                    else if (!string.IsNullOrEmpty(agentResponseMsg.NodeId))
+                    {
+                        Logger.Info($"[Agent→Tree] Agent 响应已在树中 (nodeId={agentResponseMsg.NodeId})，跳过重复添加");
                     }
 
                     // ── 添加到上下文管理器（供后续 API 调用使用）──

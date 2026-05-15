@@ -574,12 +574,59 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
             step.ResultSummary = changes.Count > 0
                 ? $"修改 {changes.Count} 个文件（格式: {operationType}）"
-                : "未检测到文件变更";
+                : $"未检测到文件变更（格式: {operationType}，已尝试匹配并应用编辑）";
 
-            // ── 编译验证提示（不再自动构建，由 AI 通过 build_solution 工具自行决定）──
+            // ── 编译验证阶段（AI 可使用完整 EditTools，包括 build_solution）──
             if (changes.Count > 0 && !ct.IsCancellationRequested && !context.IsPlanningMode)
             {
-                AddLog("INFO", "💡 代码已修改。如需编译验证，请使用 build_solution 工具。");
+                AddLog("INFO", "🔍 编辑完成，启动验证阶段（AI 可调用 build_solution 等完整工具）...");
+
+                // ── 验证阶段使用专用 system prompt：不包含"先探索再修改"指令，
+                //     避免 AI 在验证时浪费 token 重复读取文件 ──
+                const string verifySystemPrompt =
+                    "你是代码编译验证助手。你的唯一任务是编译验证已修改的代码。\n" +
+                    "不要重新探索代码库——代码已经修改完毕，直接编译验证。\n" +
+                    "如果编译失败，读取错误涉及的文件（仅相关行），修复后重新编译。\n" +
+                    "不要使用 file_search / list_dir / grep_search 等探索工具。\n" +
+                    "不要输出 apply_patch 文本格式——它是一个文本格式而非工具，请使用 replace_string_in_file 工具直接修改文件。\n" +
+                    "循环修复直到编译通过，或明确报告无法修复。";
+
+                // ── 验证阶段专用工具白名单：build + 只读 + 编辑工具（不含探索工具）──
+                var verifyToolWhitelist = new List<string>
+                {
+                    "build_solution",
+                    "read_file",
+                    "get_errors",
+                    "replace_string_in_file",
+                    "multi_replace_string_in_file",
+                    "create_file",
+                    "run_in_terminal",
+                    "get_terminal_output",
+                };
+
+                var verifyMessages = BuildContextAwareMessages(
+                    verifySystemPrompt,
+                    "## 代码修改已完成\n\n" +
+                    $"已修改 {changes.Count} 个文件：{string.Join(", ", changes.Select(c => Path.GetFileName(c.FilePath)))}\n\n" +
+                    "请立即执行以下操作：\n" +
+                    "1. 第一步就调用 build_solution 工具编译验证（不要先读文件！代码已经正确修改了）\n" +
+                    "2. 如果编译失败，用 read_file 读取报错文件的相关行，用 replace_string_in_file 直接修复\n" +
+                    "3. 修复后重新调用 build_solution 验证，直到编译通过，除非遇到无法修复的问题\n" +
+                    "4. 编译通过后简短报告结果即可\n\n" +
+                    "如果项目不支持构建（如纯脚本项目），请直接说明并跳过验证。");
+
+                string verifyResult = await CallAiWithToolLoopAsync(
+                    verifyMessages,
+                    workspaceRoot,
+                    ct,
+                    maxTokens: 4096,
+                    toolWhitelist: verifyToolWhitelist);
+
+                if (!string.IsNullOrWhiteSpace(verifyResult))
+                {
+                    step.AiResponse = (step.AiResponse ?? "") + "\n\n## 验证\n\n" + verifyResult;
+                    AddLog("INFO", "✅ 验证阶段完成");
+                }
             }
             else if (changes.Count > 0 && context.IsPlanningMode)
             {
@@ -657,7 +704,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 if (!applyResult.Success && applyResult.FailedHunks != null && applyResult.FailedHunks.Count > 0)
                 {
                     // ── Healing 机制：匹配失败 → 降级模型修正 ──
-                    AddLog("WARN", $"[EditAgent] Patch 匹配失败 ({applyResult.ErrorMessage})，启动 healing...");
+                    string failedHunkDetails = string.Join("; ", applyResult.FailedHunks.Select(h =>
+                        $"Hunk ({h.ContextMarkers.Count} 定位标记: {string.Join(", ", h.ContextMarkers.Take(3))})"));
+                    AddLog("WARN", $"[EditAgent] Patch 匹配失败 ({applyResult.ErrorMessage})，失败详情: {failedHunkDetails}，启动 healing...");
 
                     var healingRequest = new HealingRequest
                     {
@@ -675,26 +724,51 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         AddLog("INFO", "[EditAgent] Healing 成功，使用修正后的 Patch 重试...");
                         applyResult = await _editPatchService.ApplyPatchAsync(
                             healingResponse.CorrectedPatch, workspaceRoot, ct);
+
+                        // ── 兜底：Healing 修正后仍失败 → 尝试作为 create_file 写入完整内容 ──
+                        if (!applyResult.Success && !string.IsNullOrEmpty(applyResult.FinalContent))
+                        {
+                            AddLog("WARN", $"[EditAgent] Healing 修正后仍失败 ({applyResult.ErrorMessage})，启用 create_file 兜底写入...");
+                            try
+                            {
+                                await TerminalWindowHelper.WriteCodeToFileAsync(
+                                    applyResult.FilePath, applyResult.FinalContent!);
+                                applyResult.Success = true;
+                                AddLog("INFO", $"[EditAgent] ✅ create_file 兜底成功: {resolvedPath}");
+                            }
+                            catch (Exception fallbackEx)
+                            {
+                                AddLog("ERROR", $"[EditAgent] create_file 兜底也失败: {fallbackEx.Message}");
+                            }
+                        }
                     }
                     else
                     {
                         AddLog("ERROR", $"[EditAgent] Healing 失败: {healingResponse?.ErrorMessage ?? "未知"}");
                     }
                 }
+                else if (!applyResult.Success)
+                {
+                    // ── 无 FailedHunks 但仍失败（如文件不存在、权限问题等）──
+                    AddLog("ERROR", $"[EditAgent] Patch 应用失败（非匹配问题）: {resolvedPath} - {applyResult.ErrorMessage}");
+                }
 
                 appliedResults.Add(applyResult);
 
                 if (applyResult.Success)
                 {
-                    // ── 新文件：加入项目 ──
+                    // ── 新文件：先加入项目，再写入内容 ──
                     if (patch.Action == PatchFileAction.Add && !File.Exists(resolvedPath))
                     {
                         await AddFileToProjectAsync(resolvedPath, ct);
                     }
 
-                    // ── 通过 VS 文本缓冲区应用编辑 ──
-                    await _editPatchService.ApplyEditsToOpenDocumentAsync(
-                        resolvedPath, applyResult.AppliedEdits);
+                    // ── 通过 VS SDK 写入文件（正确集成编辑器，避免外部变更弹窗和行尾不一致）──
+                    if (!string.IsNullOrEmpty(applyResult.FinalContent))
+                    {
+                        await TerminalWindowHelper.WriteCodeToFileAsync(
+                            applyResult.FilePath, applyResult.FinalContent!);
+                    }
 
                     AddLog("INFO", $"✅ Patch 已应用: {resolvedPath} ({applyResult.AppliedEdits.Count} 个编辑)");
                     NotifyFileChange(plan.PlanId,
@@ -749,7 +823,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 if (!applyResult.Success && applyResult.FailedRegions != null && applyResult.FailedRegions.Count > 0)
                 {
                     // ── Healing 机制 ──
-                    AddLog("WARN", $"[EditAgent] InsertEdit 匹配失败 ({applyResult.ErrorMessage})，启动 healing...");
+                    string failedRegionDetails = string.Join("; ", applyResult.FailedRegions.Select(r =>
+                        r.Length > 80 ? r.Substring(0, 80) + "…" : r));
+                    AddLog("WARN", $"[EditAgent] InsertEdit 匹配失败 ({applyResult.ErrorMessage})，失败区域: {failedRegionDetails}，启动 healing...");
 
                     var healingRequest = new HealingRequest
                     {
@@ -771,19 +847,45 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                             FullContent = healingResponse.CorrectedInsertEditContent!,
                         };
                         applyResult = await _editPatchService.ApplyInsertEditAsync(correctedEdit, workspaceRoot, ct);
+
+                        // ── 兜底：Healing 修正后仍失败 → 尝试作为 create_file 写入完整内容 ──
+                        if (!applyResult.Success && !string.IsNullOrEmpty(applyResult.FinalContent))
+                        {
+                            AddLog("WARN", $"[EditAgent] Healing 修正后仍失败 ({applyResult.ErrorMessage})，启用 create_file 兜底写入...");
+                            try
+                            {
+                                await TerminalWindowHelper.WriteCodeToFileAsync(
+                                    applyResult.FilePath, applyResult.FinalContent!);
+                                applyResult.Success = true;
+                                AddLog("INFO", $"[EditAgent] ✅ create_file 兜底成功: {resolvedPath}");
+                            }
+                            catch (Exception fallbackEx)
+                            {
+                                AddLog("ERROR", $"[EditAgent] create_file 兜底也失败: {fallbackEx.Message}");
+                            }
+                        }
                     }
                     else
                     {
                         AddLog("ERROR", $"[EditAgent] Healing 失败: {healingResponse?.ErrorMessage ?? "未知"}");
                     }
                 }
+                else if (!applyResult.Success)
+                {
+                    // ── 无 FailedRegions 但仍失败（如文件不存在、权限问题等）──
+                    AddLog("ERROR", $"[EditAgent] InsertEdit 应用失败（非匹配问题）: {resolvedPath} - {applyResult.ErrorMessage}");
+                }
 
                 appliedResults.Add(applyResult);
 
                 if (applyResult.Success)
                 {
-                    await _editPatchService.ApplyEditsToOpenDocumentAsync(
-                        resolvedPath, applyResult.AppliedEdits);
+                    // ── 通过 VS SDK 写入文件 ──
+                    if (!string.IsNullOrEmpty(applyResult.FinalContent))
+                    {
+                        await TerminalWindowHelper.WriteCodeToFileAsync(
+                            applyResult.FilePath, applyResult.FinalContent!);
+                    }
 
                     AddLog("INFO", $"✅ InsertEdit 已应用: {resolvedPath} ({applyResult.AppliedEdits.Count} 个编辑)");
                     NotifyFileChange(plan.PlanId, "modify", resolvedPath,
@@ -1533,6 +1635,33 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 sb.AppendLine("### 📝 变更摘要");
                 sb.AppendLine();
                 sb.AppendLine(aiSummary);
+                sb.AppendLine();
+            }
+
+            // ── 步骤执行详情（即使无文件变更也展示，确保重启后内容不丢失）──
+            if (plan.Steps.Count > 0)
+            {
+                sb.AppendLine("### 📋 步骤执行详情");
+                sb.AppendLine();
+                foreach (var step in plan.Steps)
+                {
+                    string statusIcon = step.Status == AgentStepStatus.Completed ? "✅"
+                        : step.Status == AgentStepStatus.Failed ? "❌"
+                        : step.Status == AgentStepStatus.Skipped ? "⏭️"
+                        : "🔄";
+                    sb.AppendLine($"- {statusIcon} **步骤 {step.Index}**: {step.Title}");
+                    if (!string.IsNullOrEmpty(step.ResultSummary))
+                        sb.AppendLine($"  - 结果: {step.ResultSummary}");
+
+                    // ── 包含步骤的 AI 响应内容（截断），确保重启后编辑详情不丢失 ──
+                    if (!string.IsNullOrEmpty(step.AiResponse) && plan.ChangedFiles.Count == 0)
+                    {
+                        string truncated = step.AiResponse.Length > 2000
+                            ? step.AiResponse.Substring(0, 2000) + "\n…(内容已截断)"
+                            : step.AiResponse;
+                        sb.AppendLine($"  <details><summary>📝 AI 响应详情</summary>\n\n  ```\n{truncated}\n  ```\n  </details>");
+                    }
+                }
                 sb.AppendLine();
             }
 

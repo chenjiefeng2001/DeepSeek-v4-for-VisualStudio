@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
 
 namespace DeepSeek_v4_for_VisualStudio.Models
 {
@@ -173,6 +174,10 @@ namespace DeepSeek_v4_for_VisualStudio.Models
 
         /// <summary>编辑后发现的新诊断错误</summary>
         public List<string>? NewDiagnostics { get; set; }
+
+        /// <summary>编辑后的完整文件内容（行尾已标准化为 CRLF）。供调用方通过 VS SDK 写入。</summary>
+        [JsonIgnore]
+        public string? FinalContent { get; set; }
     }
 
     /// <summary>

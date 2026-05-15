@@ -508,6 +508,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 break;
             }
 
+            // ── 汇总累计 Cache 统计 ──
+            LogTotalCacheHitRate(round);
+
             return contentBuilder.ToString().Trim();
         }
 
@@ -537,6 +540,38 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             catch (Exception ex)
             {
                 Logger.Warn($"[Cache] 记录命中率异常: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 记录跨所有工具调用轮次的累计 Cache 命中率到日志（Agent 内部版）。
+        /// 在所有轮次结束后调用，输出汇总总计。
+        /// </summary>
+        private void LogTotalCacheHitRate(int finalRound)
+        {
+            try
+            {
+                long totalHit = _apiService?.TotalCacheHitTokens ?? 0;
+                long totalMiss = _apiService?.TotalCacheMissTokens ?? 0;
+                long totalCacheable = totalHit + totalMiss;
+                if (totalCacheable == 0) return;
+
+                double aggregateRate = (double)totalHit / totalCacheable;
+                string level = aggregateRate >= 0.95 ? "🟢" : aggregateRate >= 0.70 ? "🟡" : aggregateRate >= 0.30 ? "🟠" : "🔴";
+
+                Logger.Info($"[Cache] ═══════════════════════════════════════");
+                Logger.Info($"[Cache] {level} 累计汇总 ({finalRound} 轮)");
+                Logger.Info($"[Cache]   总 Cache 命中率: {aggregateRate * 100:F1}%");
+                Logger.Info($"[Cache]   累计命中: {totalHit:N0} tokens");
+                Logger.Info($"[Cache]   累计未命中: {totalMiss:N0} tokens");
+                Logger.Info($"[Cache]   累计 Prompt: {(_apiService?.TotalPromptTokens ?? 0):N0} tokens");
+                Logger.Info($"[Cache]   累计 Completion: {(_apiService?.TotalCompletionTokens ?? 0):N0} tokens");
+                Logger.Info($"[Cache]   节省比例: {aggregateRate * 100:F1}% (DeepSeek Cache 对命中 token 仅按 $0.014/M 计费)");
+                Logger.Info($"[Cache] ═══════════════════════════════════════");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[Cache] 记录汇总命中率异常: {ex.Message}");
             }
         }
 

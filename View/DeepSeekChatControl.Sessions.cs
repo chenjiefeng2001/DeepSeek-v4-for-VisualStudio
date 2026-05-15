@@ -58,11 +58,21 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     string treeJson = System.Text.Json.JsonSerializer.Serialize(treeData,
                         new System.Text.Json.JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase });
                     _activeSession.TreeDataJson = treeJson;
+
+                    // ── 诊断日志：记录树状态 ──
+                    var activePath = _tree.GetActivePath();
+                    int userMsgCount = activePath.Count(n => n.Message?.Role == "user");
+                    int assistantMsgCount = activePath.Count(n => n.Message?.Role == "assistant");
+                    Logger.Info($"[Tree] 保存: 总节点={_tree.TotalNodeCount}, 活跃路径={activePath.Count}节点 (用户={userMsgCount}, 助手={assistantMsgCount}), JSON长度={treeJson.Length}");
                 }
                 catch (Exception ex)
                 {
                     Logger.Error($"[Tree] 序列化失败: {ex.Message}", ex);
                 }
+            }
+            else
+            {
+                Logger.Warn("[Tree] 保存时 _tree 为 null，仅保存 ApiHistory");
             }
 
             // ── ApiHistory 始终保存（含 tool/system 消息，树结构不包含）──

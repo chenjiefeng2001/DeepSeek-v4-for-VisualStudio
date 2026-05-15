@@ -1,4 +1,5 @@
 using DeepSeek_v4_for_VisualStudio.Models;
+using DeepSeek_v4_for_VisualStudio.ToolWindows;
 using DeepSeek_v4_for_VisualStudio.Utils;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.ComponentModelHost;
@@ -502,17 +503,11 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 return result;
             }
 
-            // ── 所有 Hunk 匹配成功，写入文件 ──
-            try
-            {
-                await Task.Run(() => File.WriteAllText(result.FilePath, fileContent, Encoding.UTF8), ct);
-                result.Success = true;
-            }
-            catch (Exception ex)
-            {
-                result.Success = false;
-                result.ErrorMessage = $"写入文件失败: {ex.Message}";
-            }
+            // ── 所有 Hunk 匹配成功，标准化行尾并保存最终内容 ──
+            // 不直接写磁盘——由调用方通过 TerminalWindowHelper.WriteCodeToFileAsync 写入，
+            // 以正确集成 VS 编辑器（避免"外部文件变更"弹窗 + 行尾不一致提示）。
+            result.FinalContent = NormalizeToCrLf(fileContent);
+            result.Success = true;
 
             return result;
         }
@@ -714,16 +709,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             // ── 构造最终文件内容：替换 ...existing code... 为实际文件内容 ──
             string finalContent = ReconstructContent(segments, normalizedContent);
 
-            try
-            {
-                await Task.Run(() => File.WriteAllText(result.FilePath, finalContent, Encoding.UTF8), ct);
-                result.Success = true;
-            }
-            catch (Exception ex)
-            {
-                result.Success = false;
-                result.ErrorMessage = $"写入文件失败: {ex.Message}";
-            }
+            // 标准化行尾为 CRLF，由调用方通过 VS SDK 写入（避免外部变更弹窗）
+            result.FinalContent = NormalizeToCrLf(finalContent);
+            result.Success = true;
 
             return result;
         }
@@ -875,20 +863,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 }
             }
 
-            try
-            {
-                string? dir = Path.GetDirectoryName(filePath);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-
-                await Task.Run(() => File.WriteAllText(filePath, sb.ToString(), Encoding.UTF8), ct);
-                result.Success = true;
-            }
-            catch (Exception ex)
-            {
-                result.Success = false;
-                result.ErrorMessage = $"创建文件失败: {ex.Message}";
-            }
+            // 标准化行尾为 CRLF，由调用方通过 VS SDK 写入
+            result.FinalContent = NormalizeToCrLf(sb.ToString());
+            result.Success = true;
 
             return result;
         }
@@ -1426,6 +1403,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         {
             if (string.IsNullOrEmpty(text)) return text;
             return text.Replace("\r\n", "\n").Replace("\r", "\n");
+        }
+
+        /// <summary>
+        /// 将文本中的所有行尾标准化为 Windows CRLF（\r\n）。
+        /// 用于文件写回前统一行尾格式，避免 VS 弹出"行尾不一致"对话框。
+        /// </summary>
+        private static string NormalizeToCrLf(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            // 先统一为 LF，再转为 CRLF，避免产生 \r\r\n
+            return NormalizeLineEndings(text).Replace("\n", "\r\n");
         }
 
         /// <summary>
