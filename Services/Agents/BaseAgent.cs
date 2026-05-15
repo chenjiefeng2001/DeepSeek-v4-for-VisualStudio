@@ -20,6 +20,16 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         protected readonly DeepSeekApiService _apiService;
         protected readonly List<AgentLogEntry> _logs = new();
 
+        /// <summary>
+        /// 所有 Agent 共享的 System Prompt 前缀。
+        /// 放在 messages[0]，确保跨 Agent 切换时 DeepSeek Prefix Cache 仍能命中。
+        /// 各 Agent 的专属指令应追加在此前缀之后（作为同一 system 消息的第二段）。
+        /// </summary>
+        protected const string CommonSystemPromptPrefix =
+            "你是 DeepSeek v4 for Visual Studio——一个集成在 VS Code 中的 AI 编程助手。\n" +
+            "你可以使用工具来读取文件、搜索代码库、获取网页内容、运行终端命令等。\n" +
+            "使用中文回答用户的问题。\n";
+
         /// <summary>Agent 元数据定义</summary>
         public AgentDefinition Definition { get; protected set; }
 
@@ -93,6 +103,29 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         protected async Task<string> CallAiLongAsync(string systemPrompt, string userPrompt, CancellationToken ct, int maxTokens = 4096)
         {
             var messages = BuildContextAwareMessages(systemPrompt, userPrompt);
+
+            var sb = new StringBuilder();
+            await foreach (var chunk in _apiService.ChatStreamAsync(messages, null, ct))
+            {
+                if (!chunk.StartsWith("[THINKING]") && !chunk.StartsWith("[TOOL_CALL]"))
+                    sb.Append(chunk);
+            }
+            LogCacheHitRate();
+            return sb.ToString().Trim();
+        }
+
+        /// <summary>
+        /// 调用 AI 进行长回答，支持注入额外的系统级上下文（如 discoveryContext）。
+        /// extraSystemMessages 插入在历史与用户消息之间，保持 messages[0] 稳定可缓存。
+        /// </summary>
+        protected async Task<string> CallAiLongAsync(
+            string systemPrompt,
+            string userPrompt,
+            List<ChatApiMessage> extraSystemMessages,
+            CancellationToken ct,
+            int maxTokens = 4096)
+        {
+            var messages = BuildContextAwareMessages(systemPrompt, userPrompt, extraSystemMessages);
 
             var sb = new StringBuilder();
             await foreach (var chunk in _apiService.ChatStreamAsync(messages, null, ct))
@@ -198,6 +231,31 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
             // ── 第3层：当前用户消息（变化最大，放在最后）──
             messages.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+
+            return messages;
+        }
+
+        /// <summary>
+        /// 构建上下文感知的消息列表（支持注入额外的系统级上下文）。
+        /// 
+        /// 用于 Plan Agent 等需要将动态发现结果注入 prompt 的场景。
+        /// extraSystemMessages 插入在历史消息之后、用户消息之前，
+        /// 确保 messages[0]（Agent System Prompt）始终稳定可缓存。
+        /// </summary>
+        protected List<ChatApiMessage> BuildContextAwareMessages(
+            string systemPrompt,
+            string userPrompt,
+            List<ChatApiMessage> extraSystemMessages,
+            int maxRecentTurns = 5)
+        {
+            var messages = BuildContextAwareMessages(systemPrompt, userPrompt, maxRecentTurns);
+
+            // ── 在用户消息之前注入额外的 system 消息 ──
+            // 用户消息始终在最后，所以插入位置是 Count - 1
+            if (extraSystemMessages.Count > 0)
+            {
+                messages.InsertRange(messages.Count - 1, extraSystemMessages);
+            }
 
             return messages;
         }

@@ -93,6 +93,7 @@ Services/
   ExploreAgent.cs
   PlanAgent.cs
  AiPrompts.cs
+ BuildService.cs
  BuiltInToolService.cs
  ChatHtmlService.cs
  ChatHtmlService.Css.cs
@@ -111,6 +112,7 @@ Services/
  FileParserServiceAdapter.cs
  Interfaces/
   IAgentDispatcher.cs
+  IBuildService.cs
   IBuiltInToolService.cs
   IChatPersistenceService.cs
   IContextCompressorService.cs

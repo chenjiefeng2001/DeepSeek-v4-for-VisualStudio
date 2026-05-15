@@ -408,12 +408,14 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     try
                     {
                         string cacheFooter = string.Empty;
-                        var usage = _apiService?.LastUsage;
-                        if (usage != null)
+                        long totalHit = _apiService?.TotalCacheHitTokens ?? 0;
+                        long totalMiss = _apiService?.TotalCacheMissTokens ?? 0;
+                        long totalPrompt = _apiService?.TotalPromptTokens ?? 0;
+                        long totalComp = _apiService?.TotalCompletionTokens ?? 0;
+                        if (totalHit + totalMiss > 0)
                         {
                             cacheFooter = ChatHtmlService.BuildCacheHitFooterHtml(
-                                usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
-                                usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                                totalHit, totalMiss, totalPrompt, totalComp, roundCount: 1);
                         }
                         string frJs = ChatHtmlService.BuildFinalRenderJs(
                             _agentStreamingMsgIndex, agentResult.Content, string.Empty, cacheFooter);
@@ -452,12 +454,14 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     try
                     {
                         string cacheFooter = string.Empty;
-                        var usage = _apiService?.LastUsage;
-                        if (usage != null)
+                        long totalHit = _apiService?.TotalCacheHitTokens ?? 0;
+                        long totalMiss = _apiService?.TotalCacheMissTokens ?? 0;
+                        long totalPrompt = _apiService?.TotalPromptTokens ?? 0;
+                        long totalComp = _apiService?.TotalCompletionTokens ?? 0;
+                        if (totalHit + totalMiss > 0)
                         {
                             cacheFooter = ChatHtmlService.BuildCacheHitFooterHtml(
-                                usage.PromptCacheHitTokens, usage.PromptCacheMissTokens,
-                                usage.PromptTokens, usage.CompletionTokens, roundCount: 1);
+                                totalHit, totalMiss, totalPrompt, totalComp, roundCount: 1);
                         }
                         string frJs = ChatHtmlService.BuildFinalRenderJs(
                             _agentStreamingMsgIndex, errorContent, string.Empty, cacheFooter);
@@ -537,7 +541,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
         /// <summary>
         /// AgentDispatcher 层面的 PlanUpdated 回调。
-        /// 创建/更新底部任务流程面板（替代独立计划消息气泡）。
+        /// 仅对 Plan Agent 产出的计划创建/更新底部任务流程面板。
+        /// Edit Agent 内部的单步计划（IsFromPlanAgent=false）不创建面板。
         /// </summary>
         private void OnAgentDispatcherPlanUpdated(AgentTaskPlan plan)
         {
@@ -547,6 +552,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 if (ChatWebView.CoreWebView2 == null) return;
                 try
                 {
+                    // ── 仅处理 Plan Agent 产出的计划 ──
+                    if (!plan.IsFromPlanAgent) return;
+
                     string pid = plan.PlanId;
 
                     // ── C# 层面防重：已创建过面板的，只做进度更新 ──
@@ -584,8 +592,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
         /// <summary>
         /// Agent 步骤状态变更回调：更新 WebView 中的步骤进度。
-        /// 如果计划 HTML 尚未创建（单步计划场景），则先创建再更新。
-        /// 通过 _createdPlanIds 在 C# 层面防止重复创建计划消息。
+        /// 仅更新已存在的计划面板（由 OnAgentDispatcherPlanUpdated 创建）。
+        /// 无 Plan 路由的独立 Edit 不创建下方面板，只输出步骤状态到思考气泡。
         /// </summary>
         private void OnAgentPlanUpdated(AgentTaskPlan plan)
         {
@@ -598,22 +606,19 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 {
                     string pid = plan.PlanId;
 
-                    // ── C# 层面防重 ──
-                    bool alreadyCreated;
-                    lock (_lock) { alreadyCreated = _createdPlanIds.Contains(pid); }
+                    // ── 仅更新 Plan Agent 产出的计划面板（由 OnAgentDispatcherPlanUpdated 创建）──
+                    // 独立 Edit（无 Plan 路由）不创建/更新下方面板
+                    if (plan.IsFromPlanAgent)
+                    {
+                        bool alreadyCreated;
+                        lock (_lock) { alreadyCreated = _createdPlanIds.Contains(pid); }
 
-                    if (!alreadyCreated)
-                    {
-                        lock (_lock) { _createdPlanIds.Add(pid); }
-                        // 创建底部任务面板
-                        string createJs = ChatHtmlService.BuildAgentTaskPanelCreateJs(plan);
-                        await ChatWebView.CoreWebView2.ExecuteScriptAsync(createJs);
-                    }
-                    else
-                    {
-                        // 更新任务面板进度
-                        string updateJs = ChatHtmlService.BuildAgentTaskPanelUpdateJs(plan);
-                        await ChatWebView.CoreWebView2.ExecuteScriptAsync(updateJs);
+                        if (alreadyCreated)
+                        {
+                            // 更新任务面板进度
+                            string updateJs = ChatHtmlService.BuildAgentTaskPanelUpdateJs(plan);
+                            await ChatWebView.CoreWebView2.ExecuteScriptAsync(updateJs);
+                        }
                     }
 
                     // ── 输出步骤状态变更到思考气泡 ──

@@ -109,6 +109,10 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         /// <summary>Plan Agent 生成的 plan.md 文件绝对路径（Edit Agent 执行完毕后删除）</summary>
         [JsonIgnore]
         public string? PlanFilePath { get; set; }
+
+        /// <summary>标记此计划是否由 Plan Agent 产出（而非 Edit Agent 内部单步计划）。用于 UI 判断是否显示下方面板。</summary>
+        [JsonIgnore]
+        public bool IsFromPlanAgent { get; set; }
     }
 
     /// <summary>

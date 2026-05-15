@@ -84,8 +84,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
         private static string BuildSystemPrompt()
         {
-            return
-                "你是 DeepSeek Chat 的 Ask Agent——一个专注技术问答的 AI 编程助手。\n\n" +
+            return CommonSystemPromptPrefix + "\n" +
+                "你当前处于 **Ask 模式**——一个专注技术问答的 AI 编程助手。\n\n" +
                 "## 核心能力\n" +
                 "- 解释代码逻辑和架构设计\n" +
                 "- 分析技术问题和 Bug 根因\n" +

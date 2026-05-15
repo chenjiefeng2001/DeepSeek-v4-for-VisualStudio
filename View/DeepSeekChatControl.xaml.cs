@@ -292,7 +292,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
             }
 
             // ── 创建内置工具服务 ──
-            _builtInToolService = new BuiltInToolService(_mcpManager, _webSearchService);
+            var buildService = new BuildService();
+            _builtInToolService = new BuiltInToolService(_mcpManager, _webSearchService, buildService);
 
             _agentDispatcher = new AgentDispatcher(_apiService, _builtInToolService, _mcpManager);
             _agentDispatcher.ContextManager = _contextManager;

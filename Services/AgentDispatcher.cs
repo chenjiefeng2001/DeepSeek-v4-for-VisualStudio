@@ -437,6 +437,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 if (planResult.Success && planResult.Plan != null)
                 {
                     plan = planResult.Plan;
+                    plan.IsFromPlanAgent = true; // 标记来自 Plan Agent，UI 据此显示下方面板
                     ActivePlan = plan;
                     context.ActivePlan = plan;
 

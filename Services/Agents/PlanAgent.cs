@@ -71,8 +71,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
         private static string BuildSystemPrompt()
         {
-            return
-                "你是一个 Planning Agent——与用户合作创建详细的、可执行的实现计划。\n\n" +
+            return CommonSystemPromptPrefix + "\n" +
+                "你当前处于 **Plan 模式**——与用户合作创建详细的、可执行的实现计划。\n\n" +
                 "你的职责是研究代码库 → 与用户对齐 → 将发现和决策整理成全面计划。\n" +
                 "这种迭代方法在实际实现之前就捕获边缘情况和非显而易见的需求。\n\n" +
                 "你的唯一职责是规划。绝不开始实现。\n\n" +
@@ -236,7 +236,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     "需要探索的区域:";
 
                 string routingResponse = await CallAiShortAsync(
-                    "你是一个代码库探索路由器。", routingPrompt, context.CancellationToken);
+                    Definition.SystemPrompt, routingPrompt, context.CancellationToken);
 
                 var areas = routingResponse
                     .Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
@@ -317,8 +317,34 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         {
             var ct = context.CancellationToken;
 
-            string planPrompt = BuildPlanCreationPrompt(userMessage, discoveryContext, context);
-            string json = await CallAiLongAsync(Definition.SystemPrompt, planPrompt, ct, maxTokens: 2048);
+            // ── 构建额外的 system 消息（发现上下文），放在历史之后、用户消息之前 ──
+            // 这样 messages[0]（Agent System Prompt）保持稳定，可被 DeepSeek Prefix Cache 命中
+            var extraSystemMessages = new List<ChatApiMessage>();
+            if (!string.IsNullOrEmpty(discoveryContext))
+            {
+                extraSystemMessages.Add(new ChatApiMessage
+                {
+                    Role = "system",
+                    Content = "## 代码库研究发现（以下内容由 Explore 子代理搜集）\n\n" + discoveryContext
+                });
+            }
+            if (!string.IsNullOrEmpty(context.FileContext))
+            {
+                string truncated = context.FileContext.Length > 2000
+                    ? context.FileContext.Substring(0, 2000) + "\n... (已截断)"
+                    : context.FileContext;
+                extraSystemMessages.Add(new ChatApiMessage
+                {
+                    Role = "system",
+                    Content = "## 用户提供的文件上下文\n\n" + truncated
+                });
+            }
+
+            // ── 用户消息保持简洁（只有任务描述 + 指令），不含动态内容 ──
+            string planPrompt = BuildPlanCreationPrompt(userMessage, context);
+
+            string json = await CallAiLongAsync(
+                Definition.SystemPrompt, planPrompt, extraSystemMessages, ct, maxTokens: 2048);
 
             json = ExtractJsonFromMarkdown(json);
 
@@ -358,29 +384,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             };
         }
 
+        /// <summary>
+        /// 构建计划创建的 user prompt（仅包含任务描述和指令，不含动态发现内容）。
+        /// 发现上下文通过 extraSystemMessages 注入，保持 user message 简洁稳定以利于缓存。
+        /// </summary>
         private static string BuildPlanCreationPrompt(
-            string userMessage, string discoveryContext, AgentContext context)
+            string userMessage, AgentContext context)
         {
             var sb = new StringBuilder();
             sb.AppendLine("## 用户任务");
             sb.AppendLine(userMessage);
             sb.AppendLine();
-
-            if (!string.IsNullOrEmpty(discoveryContext))
-            {
-                sb.AppendLine("## 代码库研究发现");
-                sb.AppendLine(discoveryContext);
-                sb.AppendLine();
-            }
-
-            if (!string.IsNullOrEmpty(context.FileContext))
-            {
-                sb.AppendLine("## 用户提供的文件上下文");
-                sb.AppendLine(context.FileContext.Length > 2000
-                    ? context.FileContext.Substring(0, 2000) + "\n... (已截断)"
-                    : context.FileContext);
-                sb.AppendLine();
-            }
 
             if (!string.IsNullOrEmpty(context.SolutionPath))
             {
@@ -390,7 +404,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             }
 
             sb.AppendLine("## 指令");
-            sb.AppendLine("根据以上信息，创建一个详细的实现计划。");
+            sb.AppendLine("根据以上信息和代码库研究发现（已在 system 消息中提供），创建一个详细的实现计划。");
             sb.AppendLine("计划应是逐步的、可执行的，包含验证步骤。");
             sb.AppendLine();
             sb.AppendLine("输出 JSON 格式:");
@@ -448,30 +462,32 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 WriteIndented = true,
             });
 
+            // ── 发现上下文作为额外 system 消息注入（保持 messages[0] 稳定）──
+            var extraSystemMessages = new List<ChatApiMessage>();
+            if (!string.IsNullOrEmpty(discoveryContext))
+            {
+                string truncated = discoveryContext.Length > 4000
+                    ? discoveryContext.Substring(0, 4000) + "\n... (已截断)"
+                    : discoveryContext;
+                extraSystemMessages.Add(new ChatApiMessage
+                {
+                    Role = "system",
+                    Content = "## 代码库研究发现\n\n" + truncated
+                });
+            }
+            extraSystemMessages.Add(new ChatApiMessage
+            {
+                Role = "system",
+                Content = "## 已生成的 JSON 计划\n```json\n" + planJson + "\n```"
+            });
+
+            // ── 用户消息保持简洁 ──
             var prompt = new StringBuilder();
             prompt.AppendLine("## 用户原始需求");
             prompt.AppendLine(userMessage);
             prompt.AppendLine();
-
-            if (!string.IsNullOrEmpty(discoveryContext))
-            {
-                prompt.AppendLine("## 代码库研究发现");
-                // 截断过长的发现上下文
-                string truncated = discoveryContext.Length > 4000
-                    ? discoveryContext.Substring(0, 4000) + "\n... (已截断)"
-                    : discoveryContext;
-                prompt.AppendLine(truncated);
-                prompt.AppendLine();
-            }
-
-            prompt.AppendLine("## 已生成的 JSON 计划");
-            prompt.AppendLine("```json");
-            prompt.AppendLine(planJson);
-            prompt.AppendLine("```");
-            prompt.AppendLine();
-
             prompt.AppendLine("## 指令");
-            prompt.AppendLine("请基于以上信息，生成一份详细的实现计划 Markdown 文档。");
+            prompt.AppendLine("请基于以上信息（代码库研究发现和 JSON 计划已在 system 消息中提供），生成一份详细的实现计划 Markdown 文档。");
             prompt.AppendLine("文档必须包含以下章节（用中文撰写）：");
             prompt.AppendLine();
             prompt.AppendLine("### 1. 🎯 要实现的功能");
@@ -505,9 +521,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             prompt.AppendLine("- 保持专业、清晰、可执行");
 
             string markdown = await CallAiLongAsync(
-                "你是一个资深软件架构师。你的任务是将实现计划展开为详细的 Markdown 技术文档。" +
-                "输出专业、结构清晰、内容详实的中文技术文档。直接输出 Markdown，不要包裹代码块。",
-                prompt.ToString(), ct, maxTokens: 4096);
+                Definition.SystemPrompt, prompt.ToString(), extraSystemMessages, ct, maxTokens: 4096);
 
             // 如果 AI 返回了代码块包裹的内容，去掉包裹
             markdown = markdown.Trim();

@@ -14,6 +14,24 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         /// <summary>最近一次 API 调用的 Usage 信息</summary>
         DeepSeekUsage? LastUsage { get; }
 
+        /// <summary>累计 Cache 命中 token 数（跨所有 API 调用，含 Agent 内部调用）</summary>
+        long TotalCacheHitTokens { get; }
+
+        /// <summary>累计 Cache 未命中 token 数</summary>
+        long TotalCacheMissTokens { get; }
+
+        /// <summary>累计 Prompt token 数</summary>
+        long TotalPromptTokens { get; }
+
+        /// <summary>累计 Completion token 数</summary>
+        long TotalCompletionTokens { get; }
+
+        /// <summary>累计 Cache 命中率（0.0 ~ 1.0）</summary>
+        double TotalCacheHitRate { get; }
+
+        /// <summary>重置累计统计</summary>
+        void ResetAccumulatedStats();
+
         /// <summary>更新使用的模型</summary>
         void UpdateModel(string model);
 

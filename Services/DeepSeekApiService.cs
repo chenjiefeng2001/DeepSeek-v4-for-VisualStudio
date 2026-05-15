@@ -28,6 +28,44 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         /// </summary>
         public DeepSeekUsage? LastUsage { get; private set; }
 
+        /// <summary>
+        /// 累计 Cache 统计（跨所有 API 调用汇总，含 Agent 内部调用）。
+        /// 在每次 API 调用后自动累加。调用 <see cref="ResetAccumulatedStats"/> 重置。
+        /// </summary>
+        public long TotalCacheHitTokens { get; private set; }
+        public long TotalCacheMissTokens { get; private set; }
+        public long TotalPromptTokens { get; private set; }
+        public long TotalCompletionTokens { get; private set; }
+
+        /// <summary>
+        /// 累计 Cache 命中率（0.0 ~ 1.0）。
+        /// </summary>
+        public double TotalCacheHitRate => TotalCacheHitTokens + TotalCacheMissTokens > 0
+            ? (double)TotalCacheHitTokens / (TotalCacheHitTokens + TotalCacheMissTokens)
+            : 0;
+
+        /// <summary>
+        /// 重置累计 Cache 统计（新会话开始时调用）。
+        /// </summary>
+        public void ResetAccumulatedStats()
+        {
+            TotalCacheHitTokens = 0;
+            TotalCacheMissTokens = 0;
+            TotalPromptTokens = 0;
+            TotalCompletionTokens = 0;
+        }
+
+        /// <summary>
+        /// 累加一次 API 调用的 Usage 统计到累计值。
+        /// </summary>
+        private void AccumulateStats(DeepSeekUsage usage)
+        {
+            TotalCacheHitTokens += usage.PromptCacheHitTokens;
+            TotalCacheMissTokens += usage.PromptCacheMissTokens;
+            TotalPromptTokens += usage.PromptTokens;
+            TotalCompletionTokens += usage.CompletionTokens;
+        }
+
         public DeepSeekApiService(string apiKey, string model = "deepseek-v4-pro")
         {
             _model = model;
@@ -130,6 +168,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                     if (chunk?.Usage != null)
                     {
                         LastUsage = chunk.Usage;
+                        AccumulateStats(chunk.Usage);
                         cacheInfo = $"{chunk.Usage.PromptCacheHitTokens}|{chunk.Usage.PromptCacheMissTokens}|{chunk.Usage.PromptTokens}|{chunk.Usage.CompletionTokens}";
                     }
                 }
@@ -192,6 +231,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             if (result?.Usage != null)
             {
                 LastUsage = result.Usage;
+                AccumulateStats(result.Usage);
             }
 
             return result?.Choices?[0]?.Message?.Content ?? string.Empty;

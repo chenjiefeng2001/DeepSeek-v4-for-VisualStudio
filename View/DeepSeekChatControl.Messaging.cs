@@ -502,11 +502,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     const int safetyLimit = 200;                     // 绝对安全上限
                     bool loopDetected = false;
 
-                    // ── 累计 Cache 统计（跨所有轮次汇总）──
-                    long totalCacheHitTokens = 0;
-                    long totalCacheMissTokens = 0;
-                    long totalPromptTokens = 0;
-                    long totalCompletionTokens = 0;
+                    // ── 重置累计 Cache 统计（本次用户消息的所有 API 调用将统一累加到 _apiService）──
+                    _apiService?.ResetAccumulatedStats();
 
                     int round = 0;
                     while (!loopDetected)
@@ -624,18 +621,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
                             }
                         }
 
-                        // ── 累计本轮 Cache 统计 ──
-                        {
-                            var usage = _apiService?.LastUsage;
-                            if (usage != null)
-                            {
-                                totalCacheHitTokens += usage.PromptCacheHitTokens;
-                                totalCacheMissTokens += usage.PromptCacheMissTokens;
-                                totalPromptTokens += usage.PromptTokens;
-                                totalCompletionTokens += usage.CompletionTokens;
-                                LogCacheHitRate(round);
-                            }
-                        }
+                        // ── 记录本轮 Cache 命中率 ──
+                        LogCacheHitRate(round);
 
                         if (toolCallAccumulator.Count > 0)
                         {
@@ -767,7 +754,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         break;
                     }
 
-                    // ── 汇总本轮 Cache 统计（跨所有轮次）──
+                    // ── 汇总本轮 Cache 统计（跨所有轮次，从 _apiService 读取累计值）──
+                    long totalCacheHitTokens = _apiService?.TotalCacheHitTokens ?? 0;
+                    long totalCacheMissTokens = _apiService?.TotalCacheMissTokens ?? 0;
+                    long totalPromptTokens = _apiService?.TotalPromptTokens ?? 0;
+                    long totalCompletionTokens = _apiService?.TotalCompletionTokens ?? 0;
                     LogTotalCacheHitRate(round, totalCacheHitTokens, totalCacheMissTokens, totalPromptTokens, totalCompletionTokens);
 
                     // 流式完成

@@ -107,6 +107,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             "get_terminal_output",
             "create_and_run_task",
             "manage_todo_list",
+            "build_solution",
         };
 
         /// <summary>
@@ -141,8 +142,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
         private static string BuildSystemPrompt()
         {
-            return
-                "你是一个 Edit Agent——专精于按计划执行代码修改。\n\n" +
+            return CommonSystemPromptPrefix + "\n" +
+                "你当前处于 **Edit 模式**——专精于按计划执行代码修改。\n\n" +
                 "## 核心原则\n" +
                 "- 你有权修改项目文件，但要谨慎、精确\n" +
                 "- 每次修改后验证代码正确性（检查编译错误）\n" +
@@ -207,7 +208,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 "## 步骤执行\n" +
                 "- 严格按照计划步骤顺序执行\n" +
                 "- 每步完成报告进度\n" +
-                "- 遇到错误不要静默跳过，报告并请求指导";
+                "- 遇到错误不要静默跳过，报告并请求指导\n" +
+                "- **修改代码后，使用 build_solution 工具编译验证**\n" +
+                "- 如果编译失败，分析错误并修复，然后重新调用 build_solution 验证\n" +
+                "- 循环修复直到编译通过，或在多次失败后报告给用户";
         }
 
         #endregion
@@ -328,9 +332,19 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     NotifyPlanUpdated();
                     try
                     {
-                        string finalBuildResult = await ExecuteBuildStepAsync(
-                            new AgentStep { Title = "最终编译验证" }, context.SolutionPath,
-                            _agentCts.Token);
+                        string finalBuildResult;
+                        if (BuiltInTools != null)
+                        {
+                            finalBuildResult = await BuiltInTools.ExecuteBuiltInToolAsync(
+                                "build_solution", "{}", context.SolutionPath)
+                                ?? "⚠️ 构建工具未返回结果";
+                        }
+                        else
+                        {
+                            finalBuildResult = await ExecuteBuildStepAsync(
+                                new AgentStep { Title = "最终编译验证" }, context.SolutionPath,
+                                _agentCts.Token);
+                        }
                         string oneLine = finalBuildResult.Split(new[] { '\r', '\n' },
                             StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? finalBuildResult;
                         if (finalBuildResult.Contains("✅") || finalBuildResult.Contains("0 个错误"))
@@ -414,7 +428,18 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
             if (isBuildStep)
             {
-                string buildResult = await ExecuteBuildStepAsync(step, context.SolutionPath, ct);
+                // ── 使用 build_solution 工具（统一通过 BuiltInToolService 构建）──
+                string buildResult;
+                if (BuiltInTools != null)
+                {
+                    buildResult = await BuiltInTools.ExecuteBuiltInToolAsync(
+                        "build_solution", "{}", context.SolutionPath)
+                        ?? "⚠️ 构建工具未返回结果";
+                }
+                else
+                {
+                    buildResult = await ExecuteBuildStepAsync(step, context.SolutionPath, ct);
+                }
                 step.AiResponse = buildResult;
                 step.ResultSummary = buildResult.Truncate(100);
             }
@@ -551,10 +576,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 ? $"修改 {changes.Count} 个文件（格式: {operationType}）"
                 : "未检测到文件变更";
 
-            // ── 编译验证 + 多轮修复（Planning 模式下跳过每步构建，最后统一构建）──
+            // ── 编译验证提示（不再自动构建，由 AI 通过 build_solution 工具自行决定）──
             if (changes.Count > 0 && !ct.IsCancellationRequested && !context.IsPlanningMode)
             {
-                await BuildAndFixLoopAsync(step, plan, context, changes, ct);
+                AddLog("INFO", "💡 代码已修改。如需编译验证，请使用 build_solution 工具。");
             }
             else if (changes.Count > 0 && context.IsPlanningMode)
             {
@@ -1825,311 +1850,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             catch (Exception ex)
             {
                 Logger.Warn($"[EditAgent] 添加文件到项目失败: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// 构建验证 + 多轮修复循环。
-        /// 代码写入后自动编译，如果有错误，尝试让 AI 修复并重新编译，
-        /// 最多尝试 3 轮，直到构建成功或判定为无法修复。
-        /// </summary>
-        private async Task BuildAndFixLoopAsync(
-            AgentStep step,
-            AgentTaskPlan plan,
-            AgentContext context,
-            List<FileChangeSummary> appliedChanges,
-            CancellationToken ct)
-        {
-            const int maxBuildFixRounds = 3;
-
-            AddLog("INFO", "🔨 开始编译验证...");
-
-            for (int round = 1; round <= maxBuildFixRounds; round++)
-            {
-                if (ct.IsCancellationRequested) return;
-
-                // ── 执行构建 ──
-                string buildResult = await ExecuteBuildStepAsync(
-                    new AgentStep { Title = "编译验证" }, context.SolutionPath, ct);
-
-                // 只记录一行摘要到 UI 日志（错误详情已在 ExecuteBuildStepAsync 内部记录）
-                string oneLineSummary = buildResult.Split(new[] { '\r', '\n' },
-                    StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? buildResult;
-                AddLog("INFO", $"[编译 第{round}轮] {oneLineSummary}");
-
-                // 构建成功 → 结束
-                if (buildResult.Contains("✅") || buildResult.Contains("0 个错误"))
-                {
-                    AddLog("INFO", "✅ 编译通过！");
-                    return;
-                }
-
-                // 已达到最大修复轮数
-                if (round >= maxBuildFixRounds)
-                {
-                    AddLog("WARN", $"⚠️ 已尝试 {maxBuildFixRounds} 轮修复，仍存在编译错误。请手动检查。");
-                    return;
-                }
-
-                // ── AI 修复编译错误 ──
-                AddLog("INFO", $"🔧 第 {round} 轮修复：让 AI 分析并修复编译错误...");
-
-                var fixPrompt = new StringBuilder();
-                fixPrompt.AppendLine("## 编译错误修复");
-                fixPrompt.AppendLine();
-                fixPrompt.AppendLine("以下代码修改后编译失败，请分析错误并修复。");
-                fixPrompt.AppendLine();
-                fixPrompt.AppendLine($"构建结果: {buildResult}");
-                fixPrompt.AppendLine();
-                fixPrompt.AppendLine("## 已修改的文件及其当前内容");
-                foreach (var change in appliedChanges)
-                {
-                    fixPrompt.AppendLine($"### `{change.FilePath}`");
-                    fixPrompt.AppendLine();
-                    AppendFileContent(fixPrompt, change.FilePath);
-                    fixPrompt.AppendLine();
-                }
-
-                // ── 错误可能指向非修改文件（如 AI 改了 a.cpp 但编译错误在 b.h） ──
-                // 解析 buildResult 中的文件路径，读取这些"牵连文件"的内容
-                AppendErrorReferencedFiles(fixPrompt, buildResult, appliedChanges, context.SolutionPath);
-
-                fixPrompt.AppendLine("## 要求");
-                fixPrompt.AppendLine("1. 仔细阅读上面的编译错误详情，理解每个错误的根本原因");
-                fixPrompt.AppendLine("2. 优先使用 apply_patch 格式输出修复（*** Begin Patch / *** End Patch）");
-                fixPrompt.AppendLine("   也可使用 ```file: 格式输出修复后的完整文件内容");
-                fixPrompt.AppendLine("3. 只修改有编译错误的文件，不要修改其他文件");
-                fixPrompt.AppendLine("4. 确保修复后代码语法正确，类型匹配，引用完整，无未定义标识符");
-                fixPrompt.AppendLine("5. 如果涉及头文件缺失或命名空间问题，请添加正确的 #include 或 using 声明");
-
-                string fixResult = await CallAiLongAsync(
-                    Definition.SystemPrompt, fixPrompt.ToString(), ct, maxTokens: 8192);
-
-                // ── 尝试用 EditPatchService 解析修复内容（支持新格式）──
-                List<FileChangeSummary> fixChanges;
-                if (_editPatchService != null)
-                {
-                    var opType = _editPatchService.DetectOperationType(fixResult);
-                    if (opType == EditOperationType.ApplyPatch)
-                    {
-                        var patches = _editPatchService.ParsePatches(fixResult);
-                        fixChanges = patches.Select(p => new FileChangeSummary
-                        {
-                            FilePath = p.FilePath,
-                            LinesAdded = p.Hunks.Sum(h => h.Lines.Count(l => l.Type == '+')),
-                            LinesRemoved = p.Hunks.Sum(h => h.Lines.Count(l => l.Type == '-')),
-                            BriefDescription = $"{Path.GetFileName(p.FilePath)} (patch fix)",
-                        }).ToList();
-                    }
-                    else if (opType == EditOperationType.InsertEditIntoFile)
-                    {
-                        var edits = _editPatchService.ParseInsertEdits(fixResult);
-                        fixChanges = edits.Select(e => new FileChangeSummary
-                        {
-                            FilePath = e.FilePath,
-                            LinesAdded = CountLines(e.FullContent),
-                            BriefDescription = $"{Path.GetFileName(e.FilePath)} (insert_edit fix)",
-                        }).ToList();
-                    }
-                    else
-                    {
-                        fixChanges = ParseCodeChangesFromResult(fixResult);
-                    }
-                }
-                else
-                {
-                    fixChanges = ParseCodeChangesFromResult(fixResult);
-                }
-
-                if (fixChanges.Count == 0)
-                {
-                    AddLog("WARN", "AI 未产出有效的修复代码，跳过本轮修复");
-                    continue;
-                }
-
-                // ── 应用修复 ──
-                // 如果是 patch 格式且有 EditPatchService，使用 patch 方式应用
-                bool appliedAsPatch = false;
-                if (_editPatchService != null)
-                {
-                    var opType = _editPatchService.DetectOperationType(fixResult);
-                    if (opType == EditOperationType.ApplyPatch)
-                    {
-                        var patches = _editPatchService.ParsePatches(fixResult);
-                        string wsRoot = context.SolutionPath ?? string.Empty;
-                        if (!string.IsNullOrEmpty(wsRoot) && File.Exists(wsRoot))
-                            wsRoot = Path.GetDirectoryName(wsRoot) ?? wsRoot;
-
-                        foreach (var patch in patches)
-                        {
-                            if (ct.IsCancellationRequested) return;
-                            var applyResult = await _editPatchService.ApplyPatchAsync(patch, wsRoot, ct);
-                            if (applyResult.Success)
-                            {
-                                string resolvedPath = EditPatchService.ResolvePath(patch.FilePath, wsRoot);
-                                await _editPatchService.ApplyEditsToOpenDocumentAsync(
-                                    resolvedPath, applyResult.AppliedEdits);
-                                AddLog("INFO", $"🔧 修复 Patch 已应用: {resolvedPath}");
-
-                                var fixChange = new FileChangeSummary
-                                {
-                                    FilePath = resolvedPath,
-                                    LinesAdded = patch.Hunks.Sum(h => h.Lines.Count(l => l.Type == '+')),
-                                    LinesRemoved = patch.Hunks.Sum(h => h.Lines.Count(l => l.Type == '-')),
-                                    BriefDescription = $"{Path.GetFileName(resolvedPath)} (patch fix)",
-                                };
-                                if (!appliedChanges.Any(c =>
-                                    string.Equals(c.FilePath, resolvedPath, StringComparison.OrdinalIgnoreCase)))
-                                    appliedChanges.Add(fixChange);
-                                plan.ChangedFiles.Add(fixChange);
-                            }
-                            else
-                            {
-                                AddLog("ERROR", $"修复 Patch 应用失败: {patch.FilePath} - {applyResult.ErrorMessage}");
-                            }
-                        }
-                        appliedAsPatch = true;
-                    }
-                }
-
-                // ── 非 patch 格式或回退到 ```file: 全文件写入 ──
-                if (!appliedAsPatch)
-                {
-                    foreach (var fixChange in fixChanges)
-                    {
-                        if (ct.IsCancellationRequested) return;
-                        try
-                        {
-                            string resolvedPath = ResolveFilePath(fixChange.FilePath, context.SolutionPath);
-                            if (string.IsNullOrEmpty(fixChange.NewContent))
-                            {
-                                AddLog("WARN", $"修复内容为空，跳过: {resolvedPath}");
-                                continue;
-                            }
-                            string? error = await TerminalWindowHelper.WriteCodeToFileAsync(
-                                resolvedPath, fixChange.NewContent);
-
-                            if (error == null)
-                            {
-                                AddLog("INFO", $"🔧 修复写入: {resolvedPath}");
-                                if (!appliedChanges.Any(c =>
-                                    string.Equals(c.FilePath, resolvedPath, StringComparison.OrdinalIgnoreCase)))
-                                {
-                                    appliedChanges.Add(fixChange);
-                                }
-                                plan.ChangedFiles.Add(fixChange);
-                            }
-                            else
-                            {
-                                AddLog("ERROR", $"修复写入失败: {resolvedPath} - {error}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            AddLog("ERROR", $"修复写入异常: {ex.Message}");
-                        }
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// 将文件内容以带语法高亮的代码块形式附加到 prompt。
-        /// </summary>
-        private static void AppendFileContent(StringBuilder sb, string filePath)
-        {
-            try
-            {
-                if (File.Exists(filePath))
-                {
-                    string fileContent = File.ReadAllText(filePath);
-                    string lang = Path.GetExtension(filePath).TrimStart('.').ToLowerInvariant();
-                    sb.AppendLine($"```{lang}");
-                    sb.AppendLine(fileContent);
-                    sb.AppendLine("```");
-                }
-                else
-                {
-                    sb.AppendLine("_(文件不存在)_");
-                }
-            }
-            catch (Exception ex)
-            {
-                sb.AppendLine($"_无法读取文件: {ex.Message}_");
-            }
-        }
-
-        /// <summary>
-        /// 从构建结果中提取错误涉及的文件路径，读取这些"牵连文件"的内容并附加到 prompt。
-        /// 
-        /// 场景：AI 修改了 a.cpp，但编译错误指向 b.h（被 a.cpp 包含的头文件）。
-        /// 如果不提供 b.h 的内容，AI 无法有效修复错误。
-        /// </summary>
-        private static void AppendErrorReferencedFiles(
-            StringBuilder fixPrompt,
-            string buildResult,
-            List<FileChangeSummary> appliedChanges,
-            string? solutionPath)
-        {
-            if (string.IsNullOrEmpty(buildResult)) return;
-
-            // ── 从 markdown 标题 `### F:\path\to\file` 和 `### `filepath`` 中提取文件路径 ──
-            var referencedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            // 匹配 `### C:\...` 或 `### /path/...` 格式（绝对路径）
-            foreach (System.Text.RegularExpressions.Match m in
-                System.Text.RegularExpressions.Regex.Matches(buildResult,
-                    @"###\s+(?:`?)([A-Za-z]:[^\r\n`]+)"))
-            {
-                string path = m.Groups[1].Value.Trim();
-                if (path.Length > 3 && path.IndexOfAny(new[] { '\\', '/' }) >= 0)
-                    referencedPaths.Add(path);
-            }
-
-            // 从 Output Window 回退格式中匹配路径：`- file(line): error ...`
-            foreach (System.Text.RegularExpressions.Match m in
-                System.Text.RegularExpressions.Regex.Matches(buildResult,
-                    @"-\s+([A-Za-z]:[^(]+\.[a-zA-Z]+)\s*\("))
-            {
-                string path = m.Groups[1].Value.Trim();
-                if (File.Exists(path))
-                    referencedPaths.Add(path);
-            }
-
-            if (referencedPaths.Count == 0) return;
-
-            // ── 过滤：只保留不在 appliedChanges 中的文件 ──
-            var alreadyCovered = new HashSet<string>(
-                appliedChanges.Select(c => c.FilePath),
-                StringComparer.OrdinalIgnoreCase);
-
-            var missingPaths = referencedPaths
-                .Where(p => !alreadyCovered.Contains(p))
-                .Take(5) // 最多额外读取 5 个牵连文件
-                .ToList();
-
-            if (missingPaths.Count == 0) return;
-
-            fixPrompt.AppendLine("## 编译错误涉及的其他文件（非本轮修改，但错误指向它们）");
-            fixPrompt.AppendLine();
-
-            foreach (var path in missingPaths)
-            {
-                fixPrompt.AppendLine($"### `{path}`");
-                fixPrompt.AppendLine();
-                AppendFileContent(fixPrompt, path);
-                fixPrompt.AppendLine();
-            }
-
-            // ── 也加入 appliedChanges 追踪，防止后续重复读取 ──
-            foreach (var path in missingPaths)
-            {
-                appliedChanges.Add(new FileChangeSummary
-                {
-                    FilePath = path,
-                    LinesAdded = 0,
-                    LinesRemoved = 0,
-                });
             }
         }
 

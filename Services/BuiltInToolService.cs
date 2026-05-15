@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DeepSeek_v4_for_VisualStudio.Services
@@ -20,11 +21,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services
     {
         private readonly McpManagerService? _mcpManager;
         private readonly WebSearchService? _webSearchService;
+        private readonly IBuildService? _buildService;
 
-        public BuiltInToolService(McpManagerService? mcpManager = null, WebSearchService? webSearchService = null)
+        public BuiltInToolService(McpManagerService? mcpManager = null, WebSearchService? webSearchService = null, IBuildService? buildService = null)
         {
             _mcpManager = mcpManager;
             _webSearchService = webSearchService;
+            _buildService = buildService;
         }
 
         #region Tool Definitions (OpenAI Function Calling 格式)
@@ -213,6 +216,31 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                             required = new[] { "url" }
                         }
                     }
+                },
+                new ToolDefinition
+                {
+                    Type = "function",
+                    Function = new ToolFunction
+                    {
+                        Name = "build_solution",
+                        Description = "构建/编译当前解决方案。用于验证代码修改后是否能成功编译。\n" +
+                            "返回构建成功/失败状态及编译错误详情。\n" +
+                            "使用场景：修改代码后，调用此工具验证修改是否引入编译错误。\n" +
+                            "注意：此工具会触发完整的解决方案构建，可能需要一些时间。",
+                        Parameters = new
+                        {
+                            type = "object",
+                            properties = new
+                            {
+                                configuration = new
+                                {
+                                    type = "string",
+                                    description = "构建配置（如 Debug 或 Release）。省略则使用当前活动配置。"
+                                }
+                            },
+                            required = new string[] { }
+                        }
+                    }
                 }
             };
         }
@@ -274,6 +302,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                     "grep_search" => await GrepSearchAsync(args, workspaceRoot),
                     "get_errors" => await GetErrorsAsync(args),
                     "fetch_webpage" => await FetchWebpageAsync(args),
+                    "build_solution" => await BuildSolutionAsync(args, workspaceRoot),
                     _ => null  // 不是内置工具
                 };
             }
@@ -290,7 +319,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         {
             return toolName switch
             {
-                "list_dir" or "read_file" or "file_search" or "grep_search" or "get_errors" or "fetch_webpage" => true,
+                "list_dir" or "read_file" or "file_search" or "grep_search" or "get_errors" or "fetch_webpage" or "build_solution" => true,
                 _ => false
             };
         }
@@ -751,6 +780,33 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                         await FetchRecursiveAsync(childUrl, remainingDepth - 1, maxContentLength, visited, allContents);
                     }
                 }
+            }
+        }
+
+        #endregion
+
+        #region Build Tool
+
+        /// <summary>
+        /// 执行 build_solution 工具 — 构建/编译当前解决方案。
+        /// 委托给 IBuildService 执行实际的 VS SDK 构建交互。
+        /// </summary>
+        private async Task<string> BuildSolutionAsync(Dictionary<string, System.Text.Json.JsonElement> args, string? workspaceRoot)
+        {
+            if (_buildService == null)
+                return "❌ build_solution: 构建服务未初始化。请在 VS 中打开解决方案后重试。";
+
+            try
+            {
+                Logger.Info($"[BuiltInTool] build_solution 开始 (workspaceRoot={workspaceRoot ?? "(null)"})");
+                string result = await _buildService.BuildAsync(workspaceRoot, CancellationToken.None);
+                Logger.Info($"[BuiltInTool] build_solution 完成: {(result.Length > 200 ? result.Substring(0, 200) + "..." : result)}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[BuiltInTool] build_solution 异常: {ex.Message}", ex);
+                return $"❌ 构建失败: {ex.Message}";
             }
         }
 

@@ -66,8 +66,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
         private static string BuildSystemPrompt()
         {
-            return
-                "你是一个 Explore Agent——专精于快速代码库分析和高效回答问题。\n\n" +
+            return CommonSystemPromptPrefix + "\n" +
+                "你当前处于 **Explore 模式**——专精于快速代码库分析和高效回答问题。\n\n" +
                 "## 核心原则\n" +
                 "- 你只能读取代码，绝不能修改、创建或删除任何文件。\n" +
                 "- 你的输出是分析报告，包含文件路径、关键符号、可复用的模式。\n" +
