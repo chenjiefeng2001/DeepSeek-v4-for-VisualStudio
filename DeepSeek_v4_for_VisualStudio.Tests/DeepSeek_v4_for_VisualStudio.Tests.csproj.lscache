@@ -63,10 +63,16 @@ obj/Debug/net472/
  DeepSeek_v4_for_VisualStudio.Tests.AssemblyInfo.cs
  DeepSeek_v4_for_VisualStudio.Tests.GlobalUsings.g.cs
 Unit/Models/
+ AgentTypesTests.cs
+ ContextModelsTests.cs
  DeepSeekModelsTests.cs
  EditPatchModelsTests.cs
+ SkillDefinitionTests.cs
  ToolCallAccumulatorTests.cs
 Unit/Services/
+ CodeDiffServiceTests.cs
+ ContextCompressorServiceTests.cs
+ ConversationContextManagerExtendedTests.cs
  ConversationContextManagerTests.cs
  EditPatchServiceTests.cs
 Unit/Utils/StringExtensionsTests.cs
