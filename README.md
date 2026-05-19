@@ -32,7 +32,8 @@
 - **1M Token 上下文** — 承载大型代码库，智能压缩不丢信息
 - **三种编辑方法** — Patch / Insert / Create，四级匹配精准应用
 - **RAG 检索增强** — 可插拔的知识库集成
-- **双 OCR 引擎** — 读懂你的报错截图
+- **三 OCR 引擎** — 读懂你的报错截图（PaddleOCR-Sharp 本地 / Windows 内置 / MCP 远程）
+- **🌐 国际化 (i18n)** — 中英文自动切换，用户可自定义翻译
 
 ---
 
@@ -49,7 +50,8 @@
 | 🔍 **RAG 检索** | 可插拔提供者接口 · 智能缓存 · 自动注入对话上下文 · 🚧 内置向量库开发中 |
 | 🌐 **联网搜索** | 百度千帆 (月1500次免费) + DuckDuckGo 双引擎 · 额度耗尽自动切换 |
 | 📄 **文件解析** | 50+ 格式 · 代码/文档/PDF/Word/Excel 全支持 · 拖拽即解析 |
-| 🖼️ **图像 OCR** | Windows 内置 · MCP 远程 OCR 双引擎 |
+| 🖼️ **图像 OCR** | PaddleOCR-Sharp 本地 · Windows 内置 · MCP 远程 三引擎 |
+| 🌐 **国际化** | 中英文界面自动切换 · 选项页手动选择 · 用户自定义翻译 |
 | 📊 **代码差异预览** | 编辑器内红绿 Diff 标记 · 确认/撤销/一键应用 |
 | 💡 **Ghost Text 补全** | 行内灰色预测 · 上下文感知 · 可配置防抖延迟 |
 | 💬 **聊天窗口** | WebView2 渲染 · Markdown/代码高亮 · 多会话持久化 · 计划实时展示 |
@@ -224,12 +226,13 @@ ragService.IsEnabled = true;
 
 ## 图像 OCR
 
-两种 OCR 引擎满足不同场景：
+三种 OCR 引擎满足不同场景：
 
 | 引擎 | 中文识别率 | 配置难度 | 适用场景 |
 |------|-----------|----------|----------|
+| **PaddleOCR-Sharp** | 高 | 零配置（内置） | 中文/高精度 OCR（推荐） |
 | **Windows 内置** | 一般 | 零配置 | 英文截图、快速查看 |
-| **MCP OCR** | 取决于服务端 | 需配置服务器 | 中文/高精度 OCR（推荐） |
+| **MCP OCR** | 取决于服务端 | 需配置服务器 | 自定义 OCR 服务 |
 
 > 💡 直接 `Ctrl+V` 粘贴报错截图，AI 自动识别文字并分析问题，无需手动输入错误信息。
 
@@ -421,7 +424,7 @@ i18n 覆盖以下内容：
 | `RagService` | RAG 提供者注册、激活、检索结果注入 |
 | `ConversationContextManager` | 对话上下文构建，Token 预算管理，消息修剪 |
 | `WebSearchService` | 双引擎搜索，自动切换，关键词智能生成 |
-| `OcrService` | 三引擎 OCR 统一接口 |
+| `OcrService` | 三引擎 OCR 统一接口（PaddleOCR-Sharp / Windows / MCP） |
 | `FileParserService` | 50+ 格式文件文本提取 |
 | `ChatHtmlService` | WebView2 HTML/CSS/JS 生成，Markdown 渲染 |
 | `CodeDiffService` | 代码差异计算与编辑器标记 |
