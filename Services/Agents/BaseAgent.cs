@@ -112,18 +112,46 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// 构建完整工具集（不过滤白名单），用于 DeepSeek Prefix Cache 稳定。
         /// 所有 API 调用统一发送此完整工具集，保持 tools JSON 不变。
         /// 工具调用由客户端按 Agent 白名单拦截。
+        /// 
+        /// 🔑 双重合并：优先通过 BuiltInToolService 获取（已合并内置+MCP），
+        ///    同时兜底直接查询 McpManager 确保 MCP 工具不遗漏。
         /// </summary>
         protected List<ToolDefinition> BuildFullToolSet()
         {
             var fullSet = new List<ToolDefinition>();
+            var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             if (BuiltInTools != null)
             {
-                fullSet.AddRange(BuiltInTools.GetFullToolDefinitions());
+                var defs = BuiltInTools.GetFullToolDefinitions();
+                foreach (var def in defs)
+                {
+                    fullSet.Add(def);
+                    seenNames.Add(def.Function.Name);
+                }
             }
-            else if (McpManager != null && McpManager.AllTools.Count > 0)
+
+            // ── 🔑 兜底合并：直接从 McpManager 获取 MCP 工具（防止 BuiltInToolService 的
+            //    _mcpManager 引用因初始化时序问题而过时）──
+            if (McpManager != null && McpManager.AllTools.Count > 0)
             {
-                fullSet.AddRange(McpManager.GetToolDefinitions());
+                var mcpDefs = McpManager.GetToolDefinitions();
+                int added = 0;
+                foreach (var def in mcpDefs)
+                {
+                    if (!seenNames.Contains(def.Function.Name))
+                    {
+                        fullSet.Add(def);
+                        seenNames.Add(def.Function.Name);
+                        added++;
+                    }
+                }
+                if (added > 0)
+                {
+                    Logger.Info($"[Agent:{Definition.Name}] 兜底合并了 {added} 个 MCP 工具（BuiltInToolService 中缺失）");
+                }
             }
+
             return fullSet;
         }
 

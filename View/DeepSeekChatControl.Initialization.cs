@@ -329,6 +329,16 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                 await _mcpManager.InitializeAsync(enabledConfigs, cts.Token);
 
+                // ── 更新 BuiltInToolService 的 MCP 引用，使 Agent 工具集包含 MCP 工具 ──
+                if (_builtInToolService != null)
+                {
+                    _builtInToolService.UpdateMcpManager(_mcpManager,
+                        onCacheInvalidated: () =>
+                        {
+                            _agentFactory?.InvalidateFullToolSetCache();
+                        });
+                }
+
                 // ── 将 MCP 管理器注入到 Agent 工厂 ──
                 _agentFactory?.UpdateMcpManager(_mcpManager);
 

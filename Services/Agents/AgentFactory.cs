@@ -146,6 +146,19 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         }
 
         /// <summary>
+        /// 使所有 Agent 的完整工具集缓存失效（MCP 工具变更时调用）。
+        /// </summary>
+        public void InvalidateFullToolSetCache()
+        {
+            _askAgent?.InvalidateFullToolSetCache();
+            _exploreAgent?.InvalidateFullToolSetCache();
+            _planAgent?.InvalidateFullToolSetCache();
+            _editAgent?.InvalidateFullToolSetCache();
+            _buildAgent?.InvalidateFullToolSetCache();
+            Logger.Info("[AgentFactory] 所有 Agent 的完整工具集缓存已失效");
+        }
+
+        /// <summary>
         /// 根据 AgentType 获取对应的 Agent 实例。
         /// </summary>
         public BaseAgent GetAgent(AgentType type)

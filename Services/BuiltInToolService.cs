@@ -20,7 +20,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
     /// </summary>
     public class BuiltInToolService : IBuiltInToolService
     {
-        private readonly McpManagerService? _mcpManager;
+        private McpManagerService? _mcpManager;
         private readonly WebSearchService? _webSearchService;
         private readonly IBuildService? _buildService;
         private readonly IMemoryService? _memoryService;
@@ -147,6 +147,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         /// Agent 工具循环和 ContextManager 共享同一实例。
         /// </summary>
         public IToolResultCompactor? ToolResultCompactor { get; set; }
+
+        /// <summary>
+        /// 更新 MCP 管理器引用（MCP 后台初始化完成后调用）。
+        /// 由于 MCP 初始化在 BuiltInToolService 构造之后异步完成，
+        /// 需要此方法更新引用，确保 GetFullToolDefinitions() 能获取到 MCP 工具。
+        /// </summary>
+        /// <param name="mcpManager">新的 MCP 管理器实例</param>
+        /// <param name="onCacheInvalidated">可选回调，用于通知 Agent 使完整工具集缓存失效</param>
+        public void UpdateMcpManager(McpManagerService? mcpManager, Action? onCacheInvalidated = null)
+        {
+            _mcpManager = mcpManager;
+            onCacheInvalidated?.Invoke();
+            Logger.Info($"[BuiltInTool] MCP 管理器已更新 (工具数: {mcpManager?.AllTools.Count ?? 0})");
+        }
 
         public BuiltInToolService(
             McpManagerService? mcpManager = null,
