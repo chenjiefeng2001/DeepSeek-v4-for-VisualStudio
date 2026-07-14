@@ -64,6 +64,28 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
         #endregion
 
+        #region Public Methods
+
+        /// <summary>
+        /// 复用外部预创建的 <see cref="DiffViewerHandle"/>，而不是内部重新创建 Viewer。
+        /// 用于 InlineDiffSession 场景，Session 已持有 DiffViewerHandle。
+        /// </summary>
+        public void SetViewerHandle(DiffViewerHandle handle)
+        {
+            if (handle == null) throw new ArgumentNullException(nameof(handle));
+
+            // 取消 OnLoaded，不再自己创建 Viewer
+            Loaded -= OnLoaded;
+
+            _viewer = handle.Viewer;
+            DiffViewerHost.Child = handle.Viewer.VisualElement;
+            UpdateStats();
+
+            _viewer.DifferenceBuffer.SnapshotDifferenceChanged += OnSnapshotDifferenceChanged;
+        }
+
+        #endregion
+
         #region Event Handlers
 
         private void OnLoaded(object sender, RoutedEventArgs e)

@@ -239,6 +239,86 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             return viewer;
         }
 
+        /// <summary>
+        /// 基于纯文本创建只读 Diff 预览（不关联任何真实文件）。
+        /// 返回 <see cref="DiffViewerHandle"/>，由调用方管理生命周期。
+        /// 两个输入 buffer 均不可编辑，防止用户通过 Diff Viewer 修改内容。
+        /// </summary>
+        /// <param name="baselineText">原始内容（冻结的 Baseline）</param>
+        /// <param name="proposedText">建议修改后的内容</param>
+        /// <param name="contentType">内容类型（默认 "code"）</param>
+        /// <param name="viewMode">查看模式（Inline 或 SideBySide）</param>
+        public DiffViewerHandle CreateReadOnlyPreview(
+            string baselineText,
+            string proposedText,
+            string contentType = "code",
+            DifferenceViewMode viewMode = DifferenceViewMode.Inline)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            EnsureServices();
+
+            IContentType ct = _contentTypeRegistry!.GetContentType(contentType);
+
+            // 创建纯内存 buffer（不关联任何文件）
+            var baselineBuffer = _textBufferFactory!.CreateTextBuffer(baselineText ?? string.Empty, ct);
+            var proposalBuffer = _textBufferFactory.CreateTextBuffer(proposedText ?? string.Empty, ct);
+
+            // 配置差异选项
+            var diffOptions = new StringDifferenceOptions
+            {
+                DifferenceType = StringDifferenceTypes.Line | StringDifferenceTypes.Word,
+                IgnoreTrimWhiteSpace = false,
+                WordSplitBehavior = WordSplitBehavior.Default,
+            };
+
+            // 创建只读 DifferenceBuffer（disableEditing: true）
+            var differenceBuffer = _bufferFactory!.CreateDifferenceBuffer(
+                baselineBuffer,
+                proposalBuffer,
+                diffOptions,
+                disableEditing: true,
+                wrapLeftBuffer: true,
+                wrapRightBuffer: true);
+
+            // 创建编辑器选项
+            IEditorOptions editorOptions = _editorOptionsFactory!.GetOptions(differenceBuffer.InlineBuffer);
+
+            // 创建 Viewer
+            IWpfDifferenceViewer viewer;
+            try
+            {
+                viewer = _viewerFactory!.CreateDifferenceView(differenceBuffer, editorOptions);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[DiffViewer] CreateReadOnlyPreview 失败: {ex.Message}", ex);
+                throw new InvalidOperationException(
+                    "无法创建差异查看器。如果安装了 FileEncoding 扩展，请暂时禁用。", ex);
+            }
+
+            // 设置查看模式
+            try
+            {
+                if (viewer is IDifferenceViewer3 viewer3)
+                    viewer3.ViewMode = viewMode;
+                else if (viewer is IDifferenceViewer2 viewer2)
+                    viewer2.ViewMode = viewMode;
+                else
+                    viewer.ViewMode = viewMode;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[DiffViewer] 设置 ViewMode 失败: {ex.Message}");
+            }
+
+            Logger.Info($"[DiffViewer] 创建只读预览 (mode={viewMode}, " +
+                $"leftLines={baselineBuffer.CurrentSnapshot.LineCount}, " +
+                $"rightLines={proposalBuffer.CurrentSnapshot.LineCount})");
+
+            return new DiffViewerHandle(
+                baselineBuffer, proposalBuffer, differenceBuffer, viewer);
+        }
+
         #endregion
 
         #region Private Helpers
