@@ -1113,7 +1113,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     string oldContent = change.BaselineText;
                     if (oldContent != finalContent)
                     {
-                        await TerminalWindowHelper.ShowFinalDiffAsync(oldContent, finalContent, change.FilePath);
+                        // 写穿模式：已落盘，撤销时通过 _stagedWorkspace 恢复磁盘 Baseline
+                        await TerminalWindowHelper.ShowFinalDiffAsync(
+                            oldContent, finalContent, change.FilePath, _stagedWorkspace);
                     }
                 }
             }
@@ -1233,6 +1235,33 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 @"步骤\s*(\d+(?:[、,，\s]+(?:和|及|与)?\s*\d+)*)\s*[✅✔☑✓]",
                 @"step\s*(\d+(?:[,\s]+(?:and\s+)?\d+)*)\s*[✅✔☑✓]",
             };
+
+            // 模式4: 范围式声明 "步骤1-6 已完成" / "步骤1~6" / "步骤1到6" / "步骤1至6"
+            // "steps 1 through 6 done" / "steps 1-6 completed"
+            var rangePatterns = new[]
+            {
+                // "步骤2-4 也随之完成" / "步骤1~6 已完成" / "步骤1-6做完"
+                @"步骤\s*(\d+)\s*[-~—–]\s*(\d+)\s*[也已均都随之一同顺并]*\s*(?:完成|做完|搞定)",
+                @"步骤\s*(\d+)\s*(?:到|至|一直到)\s*(\d+)\s*[也已均都随之一同顺并]*\s*(?:完成|做完|搞定)",
+                @"(?:也|已|同样|一并|同时)\s*完成(?:了)?\s*步骤\s*(\d+)\s*[-~—–到至]\s*(\d+)",
+                @"[✅✔☑✓]\s*步骤\s*(\d+)\s*[-~—–到至]\s*(\d+)",
+                @"steps?\s*(\d+)\s*(?:through|to|-|~|&amp;)\s*(\d+)\s*(?:are\s+)?(?:also\s+)?(?:done|completed|finished)",
+            };
+            foreach (var pattern in rangePatterns)
+            {
+                foreach (System.Text.RegularExpressions.Match m in
+                    System.Text.RegularExpressions.Regex.Matches(response, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                {
+                    if (int.TryParse(m.Groups[1].Value, out int start) && int.TryParse(m.Groups[2].Value, out int end))
+                    {
+                        if (start > 0 && end >= start && end - start <= 50)
+                        {
+                            for (int n = start; n <= end; n++)
+                                autoCompletedIndices.Add(n);
+                        }
+                    }
+                }
+            }
             foreach (var pattern in checkPatterns)
             {
                 foreach (System.Text.RegularExpressions.Match m in
@@ -1257,7 +1286,22 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             }
 
             if (toAutoComplete.Count > 0)
+            {
+                // 推进 CurrentStepIndex 到最后一个已完成/跳过步骤，
+                // 使 UI 顶栏进度(如 "6/10")随之同步
+                // （步骤2..n 由 AI 声明完成时若仍停在旧索引，状态栏会一直显示旧计数）。
+                int advanced = completedStep.Index;
+                for (int idx = completedStep.Index + 1; idx <= plan.Steps.Count; idx++)
+                {
+                    var s = plan.Steps[idx - 1];
+                    if (s.Status is AgentStepStatus.Completed or AgentStepStatus.Skipped)
+                        advanced = idx;
+                    else
+                        break;
+                }
+                plan.CurrentStepIndex = advanced;
                 NotifyPlanUpdated();
+            }
         }
 
         /// <summary>

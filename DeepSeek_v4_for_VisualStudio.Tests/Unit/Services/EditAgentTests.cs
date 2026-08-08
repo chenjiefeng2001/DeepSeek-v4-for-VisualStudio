@@ -265,6 +265,119 @@ public class EditAgentTests
     #region Logging Events
 
     [Fact]
+    public void DetectAndAutoCompleteLaterSteps_RangeDeclaration_CompletesRangeAndAdvancesIndex()
+    {
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 6)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"步骤{i}",
+                    Status = i == 1 ? AgentStepStatus.Pending : AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "已完成第一步。步骤1-6 已完成。";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan);
+
+        // 步骤 2..6 应被自动标记为完成
+        plan.Steps.Skip(1).Should().OnlyContain(s => s.Status == AgentStepStatus.Completed);
+        // CurrentStepIndex 应推进到 6
+        plan.CurrentStepIndex.Should().Be(6);
+    }
+
+    [Fact]
+    public void DetectAndAutoCompleteLaterSteps_DashRange_CompletesSteps()
+    {
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 5)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"步骤{i}",
+                    Status = AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "前两步已完成，步骤2-4 也随之完成。";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan);
+
+        plan.Steps[1].Status.Should().Be(AgentStepStatus.Completed); // 2
+        plan.Steps[2].Status.Should().Be(AgentStepStatus.Completed); // 3
+        plan.Steps[3].Status.Should().Be(AgentStepStatus.Completed); // 4
+        plan.Steps[4].Status.Should().Be(AgentStepStatus.Pending);   // 5 不受影响
+        plan.CurrentStepIndex.Should().Be(4);
+    }
+
+    [Fact]
+    public void DetectAndAutoCompleteLaterSteps_EnglishRange_CompletesSteps()
+    {
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 4)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"Step {i}",
+                    Status = AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "Step 1 done. Steps 2 through 4 are also completed.";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan);
+
+        plan.Steps[1].Status.Should().Be(AgentStepStatus.Completed); // 2
+        plan.Steps[2].Status.Should().Be(AgentStepStatus.Completed); // 3
+        plan.Steps[3].Status.Should().Be(AgentStepStatus.Completed); // 4
+        plan.CurrentStepIndex.Should().Be(4);
+    }
+
+    [Fact]
+    public void DetectAndAutoCompleteLaterSteps_NoDeclaration_DoesNotAdvanceIndex()
+    {
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 4)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"步骤{i}",
+                    Status = AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "完成了第一步，但没有涉及后续步骤。";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan);
+
+        plan.Steps.Skip(1).Should().OnlyContain(s => s.Status == AgentStepStatus.Pending);
+        plan.CurrentStepIndex.Should().Be(1);
+    }
+
+    #endregion
+
+    [Fact]
     public void LogEntryAdded_FiresWhenExploreAgentLogs()
     {
         var agent = new EditAgent(_apiService);
@@ -283,9 +396,14 @@ public class EditAgentTests
         forwardedEntry!.Level.Should().Be("INFO");
     }
 
-    #endregion
-
     // ──────────── Reflection helpers for testing private methods ────────────
+
+    private static void DetectAndAutoCompleteLaterStepsPublic(EditAgent agent, AgentStep completedStep, AgentTaskPlan plan)
+    {
+        var method = typeof(EditAgent).GetMethod("DetectAndAutoCompleteLaterSteps",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        method!.Invoke(agent, new object[] { completedStep, plan });
+    }
 
     private static AgentTaskPlan CreateSingleStepPlanPublic(string userMessage)
     {
