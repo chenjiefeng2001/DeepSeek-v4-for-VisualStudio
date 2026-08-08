@@ -88,9 +88,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
         {
             var results = new List<EditApplyResult>();
 
-            // ── 备份追踪 ──
-            BackupService.BeginSession();
+            // ── 备份追踪（仅直接写盘模式）──
             var backups = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            if (Workspace == null)
+            {
+                BackupService.BeginSession();
+            }
 
             foreach (var edit in edits)
             {
@@ -98,8 +101,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
 
                 string resolvedPath = EditPatchService.ResolvePath(edit.FilePath, WorkspaceRoot);
 
-                // ── 首次接触文件时创建备份 ──
-                if (!backups.ContainsKey(resolvedPath))
+                // ── 首次接触文件时创建备份（仅直接写盘模式）──
+                if (Workspace == null && !backups.ContainsKey(resolvedPath))
                 {
                     backups[resolvedPath] = BackupService.CreateBackup(resolvedPath);
                 }
@@ -109,9 +112,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                 // ── Healing ──
                 if (!result.Success && result.FailedRegions != null && result.FailedRegions.Count > 0)
                 {
-                    string fileContent = File.Exists(resolvedPath)
-                        ? await Task.Run(() => File.ReadAllText(resolvedPath), ct)
-                        : string.Empty;
+                    string fileContent;
+                    if (Workspace != null)
+                    {
+                        fileContent = Workspace.ReadFile(resolvedPath);
+                    }
+                    else
+                    {
+                        fileContent = File.Exists(resolvedPath)
+                            ? await Task.Run(() => File.ReadAllText(resolvedPath), ct)
+                            : string.Empty;
+                    }
 
                     var healingRequest = new HealingRequest
                     {
@@ -141,8 +152,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                             Logger.Warn(LocalizationService.Instance.Format("tool.edit.insert.healingRetryFailed", resolvedPath));
                             try
                             {
-                                await Task.Run(() => File.WriteAllText(resolvedPath,
-                                    EditStringMatcher.NormalizeToCrLf(edit.FullContent)), ct);
+                                string fallbackContent = EditStringMatcher.NormalizeToCrLf(edit.FullContent);
+                                if (Workspace != null)
+                                {
+                                    Workspace.WriteFile(resolvedPath, fallbackContent);
+                                }
+                                else
+                                {
+                                    await Task.Run(() => File.WriteAllText(resolvedPath, fallbackContent), ct);
+                                }
                                 result.Success = true;
                                 result.FinalContent = edit.FullContent;
                             }
@@ -156,27 +174,37 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
 
                 if (result.Success && !string.IsNullOrEmpty(result.FinalContent))
                 {
-                    await Task.Run(() => File.WriteAllText(resolvedPath,
-                        EditStringMatcher.NormalizeToCrLf(result.FinalContent)), ct);
+                    string normalizedContent = EditStringMatcher.NormalizeToCrLf(result.FinalContent);
+                    if (Workspace != null)
+                    {
+                        Workspace.WriteFile(resolvedPath, normalizedContent);
+                    }
+                    else
+                    {
+                        await Task.Run(() => File.WriteAllText(resolvedPath, normalizedContent), ct);
+                    }
                 }
 
                 results.Add(result);
             }
 
-            // ── 事务提交/回滚 ──
-            bool anyFailed = results.Any(r => !r.Success);
-            if (anyFailed)
+            // ── 事务提交/回滚（仅直接写盘模式）──
+            if (Workspace == null)
             {
-                Logger.Warn("[InsertEditTool] 部分编辑失败，回滚所有已修改文件");
-                BackupService.RollbackAll(backups);
-            }
-            else
-            {
-                foreach (var kvp in backups)
-                    BackupService.CleanupBackup(kvp.Value);
+                bool anyFailed = results.Any(r => !r.Success);
+                if (anyFailed)
+                {
+                    Logger.Warn("[InsertEditTool] 部分编辑失败，回滚所有已修改文件");
+                    BackupService.RollbackAll(backups);
+                }
+                else
+                {
+                    foreach (var kvp in backups)
+                        BackupService.CleanupBackup(kvp.Value);
+                }
+                BackupService.EndSession();
             }
 
-            BackupService.EndSession();
             return results;
         }
 

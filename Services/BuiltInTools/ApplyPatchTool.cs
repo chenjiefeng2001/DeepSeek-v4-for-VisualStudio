@@ -25,6 +25,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
         /// </summary>
         public DeepSeekApiService? ApiService { get; set; }
 
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选注入）。
+        /// 设置后，工具循环中的 apply_patch 写入 Workspace 而非磁盘，
+        /// 由 Agent 结束后统一提交和 diff 预览。
+        /// </summary>
+        public Services.Editing.StagedEditWorkspace? Workspace { get; set; }
+
         public override ToolDefinition GetDefinition()
         {
             return new ToolDefinition
@@ -100,7 +107,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
                 // ── 有 ApiService → 使用完整 Healing 流程 ──
                 if (ApiService != null)
                 {
-                    var editTool = new EditTools.ApplyPatchTool(ApiService, workspaceRoot ?? string.Empty);
+                    var editTool = new EditTools.ApplyPatchTool(ApiService, workspaceRoot ?? string.Empty)
+                    {
+                        Workspace = Workspace,
+                    };
                     var editResults = await editTool.ExecutePatchesAsync(patches, CancellationToken);
 
                     var results = new List<string>();
@@ -136,20 +146,38 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
                         {
                             string filePath = ResolvePath(patch.FilePath, workspaceRoot);
 
-                            // ── 首次接触此文件时创建备份 ──
-                            if (File.Exists(filePath) && !backups.ContainsKey(filePath))
+                            // ── Workspace 模式：读取暂存内容，不创建备份 ──
+                            string sourceContent;
+                            if (Workspace != null)
                             {
-                                backups[filePath] = BackupService.CreateBackup(filePath);
+                                sourceContent = Workspace.ReadFile(filePath);
+                            }
+                            else
+                            {
+                                // ── 首次接触此文件时创建备份 ──
+                                if (File.Exists(filePath) && !backups.ContainsKey(filePath))
+                                {
+                                    backups[filePath] = BackupService.CreateBackup(filePath);
+                                }
+                                sourceContent = File.Exists(filePath)
+                                    ? await Task.Run(() => File.ReadAllText(filePath))
+                                    : string.Empty;
                             }
 
                             var result = EditTools.ApplyPatchTool.ApplySinglePatch(
-                                patch, filePath,
-                                File.Exists(filePath) ? await Task.Run(() => File.ReadAllText(filePath)) : string.Empty);
+                                patch, filePath, sourceContent);
 
                             if (result.Success && !string.IsNullOrEmpty(result.FinalContent))
                             {
-                                await Task.Run(() => File.WriteAllText(filePath,
-                                    EditStringMatcher.NormalizeToCrLf(result.FinalContent)));
+                                string normalized = EditStringMatcher.NormalizeToCrLf(result.FinalContent);
+                                if (Workspace != null)
+                                {
+                                    Workspace.WriteFile(filePath, normalized);
+                                }
+                                else
+                                {
+                                    await Task.Run(() => File.WriteAllText(filePath, normalized));
+                                }
                                 results.Add(LocalizationService.Instance.Format("tool.applyPatch.applied",
                                     Path.GetFileName(filePath), patch.Hunks.Count));
                             }
@@ -166,14 +194,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
                             }
                         }
 
-                        // ── 失败回滚 ──
-                        if (anyFailed)
+                        // ── 失败回滚（仅直接写盘模式）──
+                        if (Workspace == null && anyFailed)
                         {
                             foreach (var kv in backups)
                                 BackupService.RestoreFromBackup(kv.Key, kv.Value);
                             Logger.Warn("[Backup] 静态降级路径：部分 patch 失败，已回滚所有文件");
                         }
-                        else
+                        else if (Workspace == null)
                         {
                             // ── 成功清理 ──
                             foreach (var kv in backups)

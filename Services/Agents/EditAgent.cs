@@ -53,6 +53,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         private ReplaceStringTool? _replaceStringTool;
         private MultiReplaceStringTool? _multiReplaceStringTool;
 
+        // ── Agent 多步编辑 Workspace ──
+        private Editing.StagedEditWorkspace? _stagedWorkspace;
+
         /// <summary>
         /// ExploreAgent 引用，由 AgentFactory 注入。
         /// 用于在执行代码修改前智能发现相关文件。
@@ -775,7 +778,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             if (string.IsNullOrWhiteSpace(result) && !hasToolEdits)
             {
                 step.ResultSummary = LocalizationService.Instance["agent.log.editNoChangesConfirmed"];
-                TerminalWindowHelper.SuppressDiffPreview = false;
                 AddLog("INFO", LocalizationService.Instance["agent.log.editNoChange"]);
                 return;
             }
@@ -787,8 +789,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             var originalContents = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var appliedResults = new List<EditApplyResult>();
 
-            // ── 全局抑制 diff 预览，流程结束时统一显示一次 ──
-            TerminalWindowHelper.SuppressDiffPreview = true;
+            // ── 创建 / 重置 StagedEditWorkspace（工具通过 Workspace 暂存，不直接写盘）──
+            _stagedWorkspace ??= new Editing.StagedEditWorkspace();
+            _stagedWorkspace.Discard(); // 清空上一轮残留
+
+            // ── 注入 Workspace 到 EditAgent 级工具 + 工具循环内置工具 ──
+            EnsureEditTools(workspaceRoot);
+            if (BuiltInTools != null)
+                BuiltInTools.Workspace = _stagedWorkspace;
 
             // ── operationType 提前声明（goto 路径需要可见）──
             var operationType = EditOperationType.ApplyPatch;
@@ -1093,18 +1101,34 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 BuiltInTools.InvalidateFileReadCache(modifiedPaths);
             }
 
-            // ── 恢复 diff 预览，统一显示一次最终 diff ──
-            TerminalWindowHelper.SuppressDiffPreview = false;
+            // ── 恢复 diff 预览，从 Workspace 生成 Batch 并创建 Session ──
+            var batch = _stagedWorkspace!.ToPreparedChangeBatch();
 
-            foreach (var kvp in originalContents)
+            if (batch.Changes.Count > 0)
             {
-                // RAG-SOURCE: file-read 读取最终文件内容（diff 预览对比）
-                string finalContent = File.Exists(kvp.Key)
-                    ? await Task.Run(() => File.ReadAllText(kvp.Key), ct)
-                    : string.Empty;
-                if (kvp.Value != finalContent)
+                foreach (var change in batch.Changes)
                 {
-                    await TerminalWindowHelper.ShowFinalDiffAsync(kvp.Value, finalContent, kvp.Key);
+                    // RAG-SOURCE: file-read 读取最终文件内容（diff 预览对比）
+                    string finalContent = change.ProposedText;
+                    string oldContent = change.BaselineText;
+                    if (oldContent != finalContent)
+                    {
+                        await TerminalWindowHelper.ShowFinalDiffAsync(oldContent, finalContent, change.FilePath);
+                    }
+                }
+            }
+            else
+            {
+                // 无 Workspace 变更 → 保持旧版路径兼容
+                foreach (var kvp in originalContents)
+                {
+                    string finalContent = File.Exists(kvp.Key)
+                        ? await Task.Run(() => File.ReadAllText(kvp.Key), ct)
+                        : string.Empty;
+                    if (kvp.Value != finalContent)
+                    {
+                        await TerminalWindowHelper.ShowFinalDiffAsync(kvp.Value, finalContent, kvp.Key);
+                    }
                 }
             }
 
@@ -1655,14 +1679,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     }
 
                     bool isNewFile = !File.Exists(resolvedPath);
-                    if (isNewFile)
+                    if (isNewFile && _stagedWorkspace == null)
                     {
+                        // ── 仅直接写盘模式：预创建空文件并加入项目 ──
                         string? dir = Path.GetDirectoryName(resolvedPath);
                         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                             Directory.CreateDirectory(dir);
                         await Task.Run(() => File.WriteAllText(resolvedPath, string.Empty, System.Text.Encoding.UTF8), ct);
                         AddLog("INFO", LocalizationService.Instance.Format("agent.log.editPreCreateFile", Path.GetFileName(resolvedPath)));
                         await AddFileToProjectAsync(resolvedPath, ct);
+                    }
+                    else if (isNewFile && _stagedWorkspace != null)
+                    {
+                        AddLog("INFO", string.Format(LocalizationService.Instance["agent.log.editStagedNewFile"],
+                            Path.GetFileName(resolvedPath)));
                     }
 
                     // ── 项目文件拦截：新建/修改 .vcxproj/.sln 等前请求用户确认 ──
@@ -1683,8 +1713,21 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         continue;
                     }
 
-                    string? error = await TerminalWindowHelper.WriteCodeToFileAsync(
-                        resolvedPath, change.NewContent ?? string.Empty);
+                    string? error = null;
+
+                    if (_stagedWorkspace != null)
+                    {
+                        // ── Workspace 模式：暂存到 Workspace，不写盘（由 Agent 结束统一提交）──
+                        _stagedWorkspace.WriteFile(resolvedPath, change.NewContent ?? string.Empty);
+                        AddLog("INFO", string.Format(LocalizationService.Instance["agent.log.fileStaged"],
+                            resolvedPath, change.LinesAdded, change.LinesRemoved));
+                    }
+                    else
+                    {
+                        // ── 直接写盘模式（旧版兼容 / 无 Workspace 场景）──
+                        error = await TerminalWindowHelper.WriteCodeToFileAsync(
+                            resolvedPath, change.NewContent ?? string.Empty);
+                    }
 
                     if (error == null)
                     {
@@ -3690,6 +3733,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             _insertEditTool ??= new InsertEditTool(_apiService, workspaceRoot);
             _replaceStringTool ??= new ReplaceStringTool(_apiService, workspaceRoot);
             _multiReplaceStringTool ??= new MultiReplaceStringTool(_apiService, workspaceRoot);
+
+            // ── 注入 StagedEditWorkspace ──
+            if (_stagedWorkspace != null)
+            {
+                _applyPatchTool.Workspace = _stagedWorkspace;
+                _insertEditTool.Workspace = _stagedWorkspace;
+                _replaceStringTool.Workspace = _stagedWorkspace;
+                _multiReplaceStringTool.Workspace = _stagedWorkspace;
+            }
         }
 
         /// <summary>

@@ -15,6 +15,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
     /// </summary>
     public class DeleteFileTool : BuiltInToolBase
     {
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选注入）。
+        /// 设置后，将删除操作暂存到 Workspace（由 Agent 结束统一提交/回滚）。
+        /// </summary>
+        public Services.Editing.StagedEditWorkspace? Workspace { get; set; }
+
         public override string Name => "delete_file";
 
         public override ToolDefinition GetDefinition()
@@ -67,6 +73,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
             {
                 if (!File.Exists(filePath))
                     return LocalizationService.Instance.Format("tool.deleteFile.notFound", Path.GetFileName(filePath));
+
+                // ── Workspace 模式：暂存删除标记，不立即删除 ──
+                if (Workspace != null)
+                {
+                    Workspace.DeleteFile(filePath);
+                    return LocalizationService.Instance.Format("tool.deleteFile.stagedDelete", Path.GetFileName(filePath));
+                }
 
                 string fileName = Path.GetFileName(filePath);
                 await Task.Run(() => File.Delete(filePath));

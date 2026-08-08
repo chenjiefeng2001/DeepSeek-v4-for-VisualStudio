@@ -201,16 +201,24 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
 
                 string resolvedPath = EditPatchService.ResolvePath(patch.FilePath, WorkspaceRoot);
 
-                // ── 获取当前内容 ──
+                // ── 获取当前内容：优先 Workspace，其次磁盘 ──
                 if (!fileState.ContainsKey(resolvedPath))
                 {
-                    string original = File.Exists(resolvedPath)
-                        ? await Task.Run(() => File.ReadAllText(resolvedPath), ct)
-                        : string.Empty;
+                    string original;
+                    if (Workspace != null)
+                    {
+                        original = Workspace.ReadFile(resolvedPath);
+                    }
+                    else
+                    {
+                        original = File.Exists(resolvedPath)
+                            ? await Task.Run(() => File.ReadAllText(resolvedPath), ct)
+                            : string.Empty;
+                    }
                     fileState[resolvedPath] = original;
 
-                    // ── 首次接触文件时创建备份（事务开始）──
-                    if (!backups.ContainsKey(resolvedPath))
+                    // ── 首次接触文件时创建备份（仅直接写盘模式）──
+                    if (Workspace == null && !backups.ContainsKey(resolvedPath))
                     {
                         backups[resolvedPath] = BackupService.CreateBackup(resolvedPath);
                     }
@@ -218,12 +226,29 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
 
                 string currentContent = fileState[resolvedPath];
 
-                var result = await ApplyWithValidationAsync(
-                    patch, resolvedPath, currentContent, backups, ct);
+                EditApplyResult result;
+
+                if (Workspace != null)
+                {
+                    // ── Workspace 模式：只计算不写盘 ──
+                    result = ApplySinglePatch(patch, resolvedPath, currentContent);
+
+                    if (result.Success && !string.IsNullOrEmpty(result.FinalContent))
+                    {
+                        Workspace.WriteFile(resolvedPath,
+                            EditStringMatcher.NormalizeToCrLf(result.FinalContent));
+                    }
+                }
+                else
+                {
+                    // ── 直接写盘模式：含 Healing + 写入后校验 ──
+                    result = await ApplyWithValidationAsync(
+                        patch, resolvedPath, currentContent, backups, ct);
+                }
 
                 if (result.Success && result.PostWriteValidationPassed != false)
                 {
-                    // ── 更新内存状态（磁盘已由 ApplyWithValidationAsync 写入）──
+                    // ── 更新内存状态 ──
                     if (!string.IsNullOrEmpty(result.FinalContent))
                         fileState[resolvedPath] = result.FinalContent;
                 }
@@ -234,17 +259,19 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                 if (!result.Success)
                     anyFailed = true;
             }
-            // ── 事务提交/回滚 ──
-            if (anyFailed)
+            // ── 事务提交/回滚（仅直接写盘模式）──
+            if (Workspace == null)
             {
-                Logger.Warn("[Transaction] 部分 patch 应用失败，回滚所有已修改文件");
-                BackupService.RollbackAll(backups);
-            }
-            else
-            {
-                foreach (var kvp in backups)
-                    BackupService.CleanupBackup(kvp.Value);
-
+                if (anyFailed)
+                {
+                    Logger.Warn("[Transaction] 部分 patch 应用失败，回滚所有已修改文件");
+                    BackupService.RollbackAll(backups);
+                }
+                else
+                {
+                    foreach (var kvp in backups)
+                        BackupService.CleanupBackup(kvp.Value);
+                }
             }
 
             return results;

@@ -75,6 +75,50 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             }
         }
 
+        private Editing.StagedEditWorkspace? _workspace;
+
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选设置）。
+        /// 设置后，内置编辑工具（apply_patch / create_file）写入 Workspace 而非磁盘，
+        /// 由 Agent 结束后统一提交（preview-then-commit）。
+        /// </summary>
+        public Editing.StagedEditWorkspace? Workspace
+        {
+            get => _workspace;
+            set
+            {
+                _workspace = value;
+                SyncWorkspaceToTools();
+            }
+        }
+
+        /// <summary>
+        /// 将 Workspace 同步到需要它的内置编辑工具。
+        /// </summary>
+        private void SyncWorkspaceToTools()
+        {
+            if (_tools.TryGetValue("apply_patch", out var apt) && apt is BuiltInTools.ApplyPatchTool patchTool)
+            {
+                patchTool.Workspace = _workspace;
+            }
+            if (_tools.TryGetValue("create_file", out var cft) && cft is BuiltInTools.CreateFileTool createTool)
+            {
+                createTool.Workspace = _workspace;
+            }
+            if (_tools.TryGetValue("replace_string_in_file", out var rst) && rst is BuiltInTools.ReplaceStringInFileTool replaceTool)
+            {
+                replaceTool.Workspace = _workspace;
+            }
+            if (_tools.TryGetValue("multi_replace_string_in_file", out var mrt) && mrt is BuiltInTools.MultiReplaceStringInFileTool multiTool)
+            {
+                multiTool.Workspace = _workspace;
+            }
+            if (_tools.TryGetValue("delete_file", out var dft) && dft is BuiltInTools.DeleteFileTool deleteTool)
+            {
+                deleteTool.Workspace = _workspace;
+            }
+        }
+
         // ── 工具注册表 ──
         private readonly Dictionary<string, BuiltInToolBase> _tools = new(StringComparer.OrdinalIgnoreCase);
 

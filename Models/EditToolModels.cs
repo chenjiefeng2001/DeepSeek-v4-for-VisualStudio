@@ -121,6 +121,10 @@ namespace DeepSeek_v4_for_VisualStudio.Models
 
         /// <summary>Healing 描述（如有）</summary>
         public string? HealingDescription { get; set; }
+
+        /// <summary>编辑后的完整文件内容（Workspace 模式下用于预览，直接写盘模式下为 null）</summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string? FinalContent { get; set; }
     }
 
     /// <summary>

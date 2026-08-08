@@ -15,6 +15,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
     /// </summary>
     public class CreateFileTool : BuiltInToolBase
     {
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选注入）。
+        /// 设置后，create_file 写入 Workspace 而非磁盘（由 Agent 结束统一提交）。
+        /// </summary>
+        public Services.Editing.StagedEditWorkspace? Workspace { get; set; }
+
         public override string Name => "create_file";
 
         public override ToolDefinition GetDefinition()
@@ -84,6 +90,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
                 }
 
                 bool existed = File.Exists(filePath);
+
+                // ── Workspace 模式：写入 Workspace，不创建备份 ──
+                if (Workspace != null)
+                {
+                    Workspace.WriteFile(filePath, normalizedContent);
+                    return existed
+                        ? LocalizationService.Instance.Format("tool.createFile.overwritten", Path.GetFileName(filePath))
+                        : LocalizationService.Instance.Format("tool.createFile.createdNew", Path.GetFileName(filePath));
+                }
 
                 // ── 覆盖已存在文件前创建备份 ──
                 string? backupPath = null;

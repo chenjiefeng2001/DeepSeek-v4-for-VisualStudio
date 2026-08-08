@@ -16,6 +16,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
     {
         private readonly ReplaceStringInFileTool _singleReplacer = new();
 
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选注入），传递给内部 ReplaceStringInFileTool。
+        /// </summary>
+        public Services.Editing.StagedEditWorkspace? Workspace
+        {
+            set => _singleReplacer.Workspace = value;
+        }
+
         public override string Name => "multi_replace_string_in_file";
 
         public override ToolDefinition GetDefinition()

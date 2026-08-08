@@ -18,6 +18,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
     public class ReplaceStringInFileTool : BuiltInToolBase
     {
         /// <summary>
+        /// StagedEditWorkspace 引用（可选注入）。
+        /// 设置后，读取/写入 Workspace 而非磁盘（由 Agent 结束统一提交）。
+        /// </summary>
+        public Services.Editing.StagedEditWorkspace? Workspace { get; set; }
+
+        /// <summary>
         /// 按文件路径的读写锁，防止并行工具调用对同一文件产生竞态条件（IOException: 文件正由另一进程使用）。
         /// </summary>
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileLocks = new(
@@ -78,7 +84,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
 
             filePath = ResolvePath(filePath, workspaceRoot);
 
-            if (!File.Exists(filePath))
+            // Workspace 模式下文件必须已暂存或已存在
+            if (Workspace == null && !File.Exists(filePath))
                 return LocalizationService.Instance.Format("tool.replaceString.fileNotFound", filePath);
 
             // 按文件加锁，防止并行工具调用对同一文件产生竞态条件
@@ -86,7 +93,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
             await fileLock.WaitAsync();
             try
             {
-                string content = File.ReadAllText(filePath, Encoding.UTF8);
+                string content = Workspace != null
+                    ? Workspace.ReadFile(filePath)
+                    : File.ReadAllText(filePath, Encoding.UTF8);
                 string normalizedContent = content.Replace("\r\n", "\n").Replace("\r", "\n");
                 string normalizedOld = oldString.Replace("\r\n", "\n").Replace("\r", "\n");
                 string normalizedNew = newString.Replace("\r\n", "\n").Replace("\r", "\n");
@@ -104,6 +113,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services.BuiltInTools
                     + normalizedContent.Substring(index + normalizedOld.Length);
 
                 newContent = newContent.Replace("\n", "\r\n");
+
+                // ── Workspace 模式：写入 Workspace，不备份不落盘 ──
+                if (Workspace != null)
+                {
+                    Workspace.WriteFile(filePath, newContent);
+                    return LocalizationService.Instance.Format("tool.replaceString.replaced", Path.GetFileName(filePath));
+                }
 
                 // ── 写入前备份 ──
                 string? backupPath = BackupService.CreateBackup(filePath);

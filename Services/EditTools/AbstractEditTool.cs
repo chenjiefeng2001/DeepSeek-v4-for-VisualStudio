@@ -14,19 +14,21 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
     /// <summary>
     /// 抽象编辑工具基类 — 所有编辑工具（ReplaceString / MultiReplace / ApplyPatch / InsertEdit）的共享逻辑。
     /// 
-    /// 参考: vscode-copilot-chat abstractReplaceStringTool.tsx
-    /// 
-    /// 职责：
-    /// - 准备编辑（验证路径、读取内容、执行匹配、生成 TextEdit）
-    /// - 批量应用编辑到 VS 文本缓冲区
-    /// - 编辑后诊断检查
-    /// - Healing 集成点
-    /// - 日志/遥测
+    /// 支持两种模式：
+    /// - 直接写盘（Workspace 为 null）—— 原有行为
+    /// - 暂存到 StagedEditWorkspace（Workspace 不为 null）—— Agent 多步编辑，最后由用户确认后统一提交
     /// </summary>
     public abstract class AbstractEditTool
     {
         protected readonly DeepSeekApiService ApiService;
         protected readonly string WorkspaceRoot;
+
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选）。
+        /// 设置后，ApplyAllEditsAsync 将写入 Workspace 而非磁盘，
+        /// 备份和 VS buffer 更新推迟到用户确认后的提交阶段。
+        /// </summary>
+        public Editing.StagedEditWorkspace? Workspace { get; set; }
 
         protected AbstractEditTool(DeepSeekApiService apiService, string workspaceRoot)
         {
@@ -118,11 +120,19 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                 return prepared;
             }
 
-            // ── 读取文件当前内容 ──
+            // ── 读取文件当前内容：优先 Workspace，其次磁盘 ──
             string fileContent;
             try
             {
-                fileContent = await Task.Run(() => File.ReadAllText(prepared.FilePath), ct);
+                if (Workspace != null)
+                {
+                    // 从 Workspace 读取（可能是之前步骤的暂存内容）
+                    fileContent = Workspace.ReadFile(prepared.FilePath);
+                }
+                else
+                {
+                    fileContent = await Task.Run(() => File.ReadAllText(prepared.FilePath), ct);
+                }
             }
             catch (Exception ex)
             {
@@ -225,9 +235,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
             var result = new EditToolResult();
             var fileResults = new List<EditedFileResult>();
 
-            // ── 备份追踪 ──
-            BackupService.BeginSession();
+            // ── 备份追踪（仅直接写盘模式）──
             var backups = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            if (Workspace == null)
+            {
+                BackupService.BeginSession();
+            }
 
             foreach (var prepared in edits)
             {
@@ -277,10 +290,36 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                     backups[prepared.FilePath] = BackupService.CreateBackup(prepared.FilePath);
                 }
 
-                // ── 写入文件系统 ──
+                // ── 写入：优先 Workspace，其次磁盘 ──
                 try
                 {
-                    await Task.Run(() => File.WriteAllText(prepared.FilePath, finalContent), ct);
+                    if (Workspace != null)
+                    {
+                        // 暂存到 Workspace，不写盘，不创建备份
+                        Workspace.WriteFile(prepared.FilePath, finalContent);
+                        fileResult.FinalContent = finalContent;
+                    }
+                    else
+                    {
+                        // 直接写盘（原有行为）
+                        if (!backups.ContainsKey(prepared.FilePath))
+                        {
+                            backups[prepared.FilePath] = BackupService.CreateBackup(prepared.FilePath);
+                        }
+
+                        await Task.Run(() => File.WriteAllText(prepared.FilePath, finalContent), ct);
+
+                        // ── 更新 VS 编辑器缓冲区 ──
+                        try
+                        {
+                            await EditBufferApplier.ApplyEditsToOpenDocumentAsync(
+                                prepared.FilePath, prepared.GeneratedEdit.TextEdits);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn(LocalizationService.Instance.Format("tool.edit.vsUpdateFailed", ToolName, ex.Message));
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -288,17 +327,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                     fileResults.Add(fileResult);
                     result.FailureCount++;
                     continue;
-                }
-
-                // ── 更新 VS 编辑器缓冲区 ──
-                try
-                {
-                    await EditBufferApplier.ApplyEditsToOpenDocumentAsync(
-                        prepared.FilePath, prepared.GeneratedEdit.TextEdits);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warn(LocalizationService.Instance.Format("tool.edit.vsUpdateFailed", ToolName, ex.Message));
                 }
 
                 fileResults.Add(fileResult);
@@ -317,27 +345,25 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
             result.Files = fileResults;
             result.AllSucceeded = result.FailureCount == 0;
 
-            // ── 事务提交/回滚 ──
-            if (!result.AllSucceeded)
+            // ── 事务提交/回滚（仅直接写盘模式需处理备份）──
+            if (Workspace == null)
             {
-                Logger.Warn("[AbstractEditTool] 部分编辑失败，回滚所有已修改文件");
-                BackupService.RollbackAll(backups);
-                result.ErrorSummary = string.Join("; ",
-                    fileResults.Where(f => f.ErrorMessage != null)
-                               .Select(f => $"{Path.GetFileName(f.FilePath)}: {f.ErrorMessage}"));
-            }
-            else
-            {
-                result.ErrorSummary = string.Join("; ",
-                    fileResults.Where(f => f.ErrorMessage != null)
-                               .Select(f => $"{Path.GetFileName(f.FilePath)}: {f.ErrorMessage}"));
-
-                // ── 成功清理备份 ──
-                foreach (var kvp in backups)
-                    BackupService.CleanupBackup(kvp.Value);
+                if (!result.AllSucceeded)
+                {
+                    Logger.Warn("[AbstractEditTool] 部分编辑失败，回滚所有已修改文件");
+                    BackupService.RollbackAll(backups);
+                }
+                else
+                {
+                    foreach (var kvp in backups)
+                        BackupService.CleanupBackup(kvp.Value);
+                }
+                BackupService.EndSession();
             }
 
-            BackupService.EndSession();
+            result.ErrorSummary = string.Join("; ",
+                fileResults.Where(f => f.ErrorMessage != null)
+                           .Select(f => $"{Path.GetFileName(f.FilePath)}: {f.ErrorMessage}"));
             return result;
         }
 

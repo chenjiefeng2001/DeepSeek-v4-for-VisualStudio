@@ -23,12 +23,6 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
     public static class TerminalWindowHelper
     {
         /// <summary>
-        /// 全局开关：设为 true 时抑制所有 diff 预览。
-        /// EditAgent 在批量修改期间设为 true，流程结束时再统一显示一次最终 diff。
-        /// </summary>
-        public static bool SuppressDiffPreview { get; set; }
-
-        /// <summary>
         /// 在流程结束时统一显示一次最终 diff 预览。
         /// 比较原始内容和最终内容，在编辑器中激活差异标记。
         /// </summary>
@@ -62,19 +56,49 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
         #region Public Methods
 
         /// <summary>
-        /// 使用 VS SDK 文本缓冲区 API 将完整代码写入指定文件。
-        /// 相较于 File.WriteAllText，此方法正确集成 VS 编辑器基础结构：
-        /// - 如果文件已在编辑器中打开，修改会纳入撤销历史（Ctrl+Z）
-        /// - 如果文件未打开，使用不可见编辑器在后台加载、修改并保存，不会弹出新标签页
-        /// - 自动处理文件编码（UTF-8 with BOM for .cs/.vb 等）
-        /// 
-        /// 返回 null 表示成功；返回错误字符串表示失败原因。
-        /// 
-        /// API 参考：
-        /// - IVsTextLines / ITextBuffer: https://learn.microsoft.com/visualstudio/extensibility/inside-the-editor
+        /// 准备代码变更（不写盘）。返回 PreparedChangeSet 供预览使用。
         /// </summary>
-        /// <param name="filePath">目标文件的完整路径。</param>
-        /// <param name="newContent">要写入的新内容（完整文件内容）。</param>
+        /// <param name="filePath">目标文件绝对路径</param>
+        /// <param name="newContent">新的完整文件内容</param>
+        /// <returns>PreparedChangeSet，失败返回 null</returns>
+        public static Models.PreparedChangeSet? PrepareCodeChange(string filePath, string newContent)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || newContent == null)
+                return null;
+
+            // 代码内容合法性检测
+            if (!string.IsNullOrWhiteSpace(newContent)
+                && !Utils.CodeContentValidator.IsProbablySourceCode(filePath, newContent))
+                return null;
+
+            string baselineText = File.Exists(filePath) ? File.ReadAllText(filePath) : string.Empty;
+            if (baselineText == newContent) return null;
+
+            bool isNewFile = !File.Exists(filePath);
+
+            return new Models.PreparedChangeSet
+            {
+                FilePath = filePath,
+                Operation = isNewFile ? Models.ProposedFileOperation.Add : Models.ProposedFileOperation.Modify,
+                BaselineText = baselineText,
+                ProposedText = newContent,
+                SaveBehavior = Models.ProposalSaveBehavior.SaveImmediately,
+            };
+        }
+
+        /// <summary>
+        /// 提交已准备好的代码变更（仅供 ProposalCommitCoordinator 调用）。
+        /// </summary>
+        public static async Task<string?> CommitCodeChangeAsync(string filePath, string newContent)
+        {
+            // 委托给旧的可靠写入方法
+            return await WriteCodeToFileAsync(filePath, newContent);
+        }
+
+        /// <summary>
+        /// 使用 VS SDK 文本缓冲区 API 将完整代码写入指定文件。
+        /// 如果不是 preview-then-commit 路径，应优先使用 PrepareCodeChange + CommitCodeChange。
+        /// </summary>
         public static async Task<string?> WriteCodeToFileAsync(string filePath, string newContent)
         {
             if (string.IsNullOrWhiteSpace(filePath))
@@ -320,8 +344,6 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
         /// </summary>
         private static void TryBeginDiffPreview(string oldContent, string newContent, string filePath)
         {
-            if (SuppressDiffPreview) return;
-
             // 空旧内容表示新建文件，仍应显示 diff（全部为新增行）
             if (oldContent == newContent)
                 return;
@@ -403,8 +425,6 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
         /// </summary>
         private static void TryRegisterPendingDiff(string oldContent, string newContent, string filePath)
         {
-            if (SuppressDiffPreview) return;
-
             if (string.IsNullOrEmpty(oldContent) || oldContent == newContent)
                 return;
 

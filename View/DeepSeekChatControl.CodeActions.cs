@@ -227,7 +227,8 @@ namespace DeepSeek_v4_for_VisualStudio.View
         }
 
         /// <summary>
-        /// 在编辑器中替换选中代码（或全部内容），并触发编辑器内 diff 预览。
+        /// 在编辑器中预览 AI 修改（preview-then-commit）。
+        /// 预览阶段不修改真实文档，用户点击「保留」后才写入。
         /// </summary>
         public async Task ReplaceCodeInEditorAsync(string newCode, bool replaceAll = false)
         {
@@ -239,7 +240,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 string? oldContent = null;
                 IWpfTextView? wpfView = null;
 
-                // ── 首先尝试获取 IWpfTextView（用于 diff 预览）──
+                // ── 获取 IWpfTextView（用于 diff 预览）──
                 var textManager = (IVsTextManager)Package.GetGlobalService(typeof(SVsTextManager));
                 if (textManager != null)
                 {
@@ -254,111 +255,139 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     }
                 }
 
-                // ── 捕获修改前的内容 ──
+                // ── 捕获修改前的内容并构建结构化 TextChanges ──
+                string fullText = string.Empty;
+                var textChanges = new List<ProposedTextChange>();
+
                 if (wpfView != null)
                 {
+                    fullText = wpfView.TextSnapshot.GetText();
                     NormalizedSnapshotSpanCollection selection = wpfView.Selection.SelectedSpans;
                     if (selection.Count > 0 && !selection[0].IsEmpty && !replaceAll)
                     {
                         oldContent = selection[0].GetText();
+                        // 构建单条 TextChange：在完整文本中定位选区
+                        textChanges.Add(new ProposedTextChange
+                        {
+                            Offset = selection[0].Start.Position,
+                            Length = selection[0].Length,
+                            NewText = newCode,
+                            MatchedText = oldContent,
+                        });
                     }
                     else
                     {
-                        oldContent = wpfView.TextSnapshot.GetText();
+                        oldContent = fullText;
                     }
                 }
 
-                // ── 方案1：DTE ActiveDocument ──
-                var dte = (DTE)Package.GetGlobalService(typeof(DTE));
-                var doc = dte?.ActiveDocument;
-                if (doc != null)
+                // ── 获取文件路径（用于日志和 RecordManualCodeChange）──
+                string? filePath = GetActiveDocumentPath();
+
+                // ── 禁用 diff 预览或未获取到视图 → 直接写入（旧版兼容路径）──
+                if (wpfView == null || _options != null && !_options.ShowDiffMarkersInEditor)
                 {
-                    var textDoc = (TextDocument)doc.Object("TextDocument");
-                    var selection = textDoc.Selection as TextSelection;
-
-                    if (oldContent == null)
-                    {
-                        oldContent = selection != null && !selection.IsEmpty && !replaceAll
-                            ? selection.Text
-                            : textDoc.StartPoint.CreateEditPoint().GetText(textDoc.EndPoint);
-                    }
-
-                    if (selection != null && !selection.IsEmpty && !replaceAll)
-                    {
-                        selection.Text = newCode;
-                        Logger.Info("[CodeAction] 已替换编辑器选中内容（DTE）");
-                    }
-                    else
-                    {
-                        var editPoint = textDoc.StartPoint.CreateEditPoint();
-                        editPoint.ReplaceText(textDoc.EndPoint, newCode, 0);
-                        Logger.Info("[CodeAction] 已替换编辑器全部内容（DTE）");
-                    }
-
-                    // ── 触发编辑器内 diff 预览 ──
-                    if (wpfView != null && !string.IsNullOrEmpty(oldContent)
-                        && (_options == null || _options.ShowDiffMarkersInEditor))
-                    {
-                        EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newCode);
-                        StatusLabel.Text = LocalizationService.Instance["codeAction.previewMode"];
-                    }
-                    else
-                    {
-                        StatusLabel.Text = LocalizationService.Instance["codeAction.writeSuccess"];
-                    }
-
-                    // ── 记录文件变更历史（用于后续重试回退）──
-                    RecordManualCodeChange(oldContent, newCode, GetActiveDocumentPath());
-
-                    Logger.Info(LocalizationService.Instance["write.appliedToEditor"]);
+                    await WriteDirectlyAsync(newCode, replaceAll, oldContent, wpfView, filePath);
                     return;
                 }
 
-                // ── 方案2：IVsTextManager.GetActiveView ──
-                if (wpfView != null)
+                // ── 新版预览路径：先预览，用户确认后再写入 ──
+                var session = EditorDiffMarkerService.Instance.CreateInlineDiffPreview(
+                    wpfView, oldContent ?? string.Empty, newCode, textChanges);
+
+                if (session != null)
                 {
-                    ITextBuffer textBuffer = wpfView.TextBuffer;
-                    NormalizedSnapshotSpanCollection selection = wpfView.Selection.SelectedSpans;
+                    StatusLabel.Text = LocalizationService.Instance["codeAction.previewMode"];
 
-                    using (ITextEdit edit = textBuffer.CreateEdit())
-                    {
-                        if (selection.Count > 0 && !selection[0].IsEmpty && !replaceAll)
-                        {
-                            edit.Replace(selection[0], newCode);
-                        }
-                        else
-                        {
-                            edit.Replace(new SnapshotSpan(wpfView.TextSnapshot, 0, wpfView.TextSnapshot.Length), newCode);
-                        }
-                        edit.Apply();
-                    }
-
-                    // ── 触发编辑器内 diff 预览 ──
-                    if (!string.IsNullOrEmpty(oldContent)
-                        && (_options == null || _options.ShowDiffMarkersInEditor))
-                    {
-                        EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newCode);
-                        StatusLabel.Text = LocalizationService.Instance["codeAction.previewMode"];
-                    }
-                    else
-                    {
-                        StatusLabel.Text = LocalizationService.Instance["codeAction.writeSuccess"];
-                    }
-
-                    // ── 记录文件变更历史（用于后续重试回退）──
-                    RecordManualCodeChange(oldContent, newCode, GetActiveDocumentPath());
-
-                    Logger.Info("[CodeAction] 已替换编辑器内容（IVsTextManager）");
-                    return;
+                    // 记录文件变更历史（用于后续重试回退）
+                    RecordManualCodeChange(oldContent, newCode, filePath);
+                    Logger.Info("[CodeAction] Inline Diff 预览已激活（preview-then-commit）");
                 }
-
-                StatusLabel.Text = LocalizationService.Instance["codeAction.noOpenDoc"];
+                else
+                {
+                    // Session 创建失败 → 降级到直接写入
+                    await WriteDirectlyAsync(newCode, replaceAll, oldContent, wpfView, filePath);
+                }
             }
             catch (Exception ex)
             {
                 Logger.Error($"替换代码失败: {ex.Message}", ex);
                 StatusLabel.Text = string.Format(LocalizationService.Instance["codeAction.writeFailed"], ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 直接写入编辑器（旧版兼容路径，无 diff 预览或 session 创建失败时使用）。
+        /// </summary>
+        private async Task WriteDirectlyAsync(
+            string newCode, bool replaceAll, string? oldContent,
+            IWpfTextView? wpfView, string? filePath)
+        {
+            // ── 方案1：DTE ActiveDocument ──
+            var dte = (DTE)Package.GetGlobalService(typeof(DTE));
+            var doc = dte?.ActiveDocument;
+            if (doc != null)
+            {
+                var textDoc = (TextDocument)doc.Object("TextDocument");
+                var selection = textDoc.Selection as TextSelection;
+
+                if (selection != null && !selection.IsEmpty && !replaceAll)
+                {
+                    selection.Text = newCode;
+                    Logger.Info("[CodeAction] 已替换编辑器选中内容（DTE，直接写入）");
+                }
+                else
+                {
+                    var editPoint = textDoc.StartPoint.CreateEditPoint();
+                    editPoint.ReplaceText(textDoc.EndPoint, newCode, 0);
+                    Logger.Info("[CodeAction] 已替换编辑器全部内容（DTE，直接写入）");
+                }
+
+                if (wpfView != null && !string.IsNullOrEmpty(oldContent))
+                {
+                    EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newCode);
+                    StatusLabel.Text = LocalizationService.Instance["codeAction.previewMode"];
+                }
+                else
+                {
+                    StatusLabel.Text = LocalizationService.Instance["codeAction.writeSuccess"];
+                }
+
+                RecordManualCodeChange(oldContent, newCode, filePath);
+                return;
+            }
+
+            // ── 方案2：IVsTextManager.GetActiveView ──
+            if (wpfView != null)
+            {
+                ITextBuffer textBuffer = wpfView.TextBuffer;
+                NormalizedSnapshotSpanCollection selection = wpfView.Selection.SelectedSpans;
+
+                using (ITextEdit edit = textBuffer.CreateEdit())
+                {
+                    if (selection.Count > 0 && !selection[0].IsEmpty && !replaceAll)
+                        edit.Replace(selection[0], newCode);
+                    else
+                        edit.Replace(new SnapshotSpan(wpfView.TextSnapshot, 0, wpfView.TextSnapshot.Length), newCode);
+                    edit.Apply();
+                }
+
+                if (!string.IsNullOrEmpty(oldContent))
+                {
+                    EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newCode);
+                    StatusLabel.Text = LocalizationService.Instance["codeAction.previewMode"];
+                }
+                else
+                {
+                    StatusLabel.Text = LocalizationService.Instance["codeAction.writeSuccess"];
+                }
+
+                RecordManualCodeChange(oldContent, newCode, filePath);
+                Logger.Info("[CodeAction] 已替换编辑器内容（IVsTextManager，直接写入）");
+                return;
+            }
+
+            StatusLabel.Text = LocalizationService.Instance["codeAction.noOpenDoc"];
         }
 
         #endregion
@@ -552,8 +581,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 if (openView != null && !string.IsNullOrEmpty(oldContent)
                     && (_options == null || _options.ShowDiffMarkersInEditor))
                 {
-                    // ── 文件已打开 → 使用编辑器内 diff 预览 ──
-                    EditorDiffMarkerService.Instance.BeginDiffPreview(openView, oldContent, code);
+                    // ── 文件已打开 → 新版 Inline Diff 预览（preview-then-commit）──
+                    var session = EditorDiffMarkerService.Instance.CreateInlineDiffPreview(
+                        openView, oldContent, code);
 
                     int addLines = diffLinesAdd(oldContent, code);
                     int delLines = diffLinesDel(oldContent, code);
@@ -561,7 +591,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     StatusLabel.Text = (addLines > 0 || delLines > 0)
                         ? string.Format(LocalizationService.Instance["codeAction.previewingWithStats"], fileName, addLines, delLines)
                         : string.Format(LocalizationService.Instance["codeAction.previewing"], fileName);
-                    Logger.Info($"[CodeAction] 编辑器内 diff 预览已激活: {filePath}");
+                    Logger.Info($"[CodeAction] Inline Diff 预览已激活: {filePath}");
                 }
                 else
                 {

@@ -1,23 +1,23 @@
+using DeepSeek_v4_for_VisualStudio.Models;
+using DeepSeek_v4_for_VisualStudio.Services.Editing;
 using DeepSeek_v4_for_VisualStudio.Utils;
 using DeepSeek_v4_for_VisualStudio.View;
+using DeepSeek_v4_for_VisualStudio.View.Hosts;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Editor;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace DeepSeek_v4_for_VisualStudio.Services
 {
     /// <summary>
     /// 编辑器 Diff 预览管理服务。
-    /// 使用 <see cref="DiffViewerService"/> 创建 VS 内置的差异对比视图。
-    ///
-    /// 工作流：
-    /// 1. 调用方将新代码写入编辑器缓冲区
-    /// 2. 调用 <see cref="BeginDiffPreview"/> 弹出差异查看浮窗
-    /// 3. 用户点击「确认变更」→ 保留新代码，关闭浮窗
-    /// 4. 用户点击「撤销」→ 回退缓冲区到原始代码，关闭浮窗
+    /// 支持两种模式：旧版 write-then-preview（兼容路径）和新的 preview-then-commit（InlineDiffSession）。
     /// </summary>
     public class EditorDiffMarkerService
     {
@@ -45,13 +45,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services
 
         #region Fields
 
-        // 每个 buffer 对应的活跃差异预览窗口
+        // 每个 buffer 对应的活跃差异预览窗口（旧版 write-then-preview）
         private readonly Dictionary<ITextBuffer, DiffViewerWindow> _activeWindows = new();
         private readonly object _windowsLock = new();
 
         // 待处理 diff 存储（按文件路径，用于未打开的文件）
         private readonly Dictionary<string, PendingFileDiff> _pendingDiffs = new();
         private readonly object _pendingLock = new();
+
+        // ── 新版 Session-based diff ──
+        private readonly InlineDiffSessionManager _sessionManager = new();
+        private readonly FloatingWindowDiffHost _diffHost = new();
 
         /// <summary>待处理 diff 的默认过期时间（30 分钟）。</summary>
         private static readonly TimeSpan PendingDiffTtl = TimeSpan.FromMinutes(30);
@@ -153,7 +157,75 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         }
 
         /// <summary>
-        /// 获取活跃差异预览的 buffer 数量。
+        /// 新版 Inline Diff 预览（preview-then-commit）。
+        /// 预览阶段不修改 sourceBuffer，用户确认后才通过 ProposalCommitCoordinator 提交。
+        /// </summary>
+        /// <param name="textView">目标 WPF 文本视图（缓冲区应仍为原始内容）</param>
+        /// <param name="originalContent">修改前的原始代码</param>
+        /// <param name="proposedContent">AI 建议的新代码</param>
+        public InlineDiffSession? CreateInlineDiffPreview(
+            IWpfTextView textView, string originalContent, string proposedContent,
+            IReadOnlyList<ProposedTextChange>? textChanges = null)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (textView == null)
+                throw new ArgumentNullException(nameof(textView));
+
+            if (string.IsNullOrEmpty(proposedContent) || originalContent == proposedContent)
+                return null;
+
+            // 获取文件路径
+            string filePath = GetFilePathFromBuffer(textView.TextBuffer)
+                ?? textView.TextBuffer.GetHashCode().ToString();
+
+            // 构建 PreparedChangeSet
+            var change = new PreparedChangeSet
+            {
+                FilePath = filePath,
+                Operation = ProposedFileOperation.Modify,
+                BaselineText = originalContent,
+                ProposedText = proposedContent,
+                TextChanges = textChanges ?? Array.Empty<ProposedTextChange>(),
+                ContentTypeName = textView.TextBuffer.ContentType.TypeName,
+                SaveBehavior = ProposalSaveBehavior.KeepDocumentDirty,
+            };
+
+            // 创建 Session
+            var session = _sessionManager.CreateSession(textView, change);
+
+            if (session == null)
+            {
+                Logger.Warn($"[EditorDiff] 无法创建 Session: {Path.GetFileName(filePath)}");
+                return null;
+            }
+
+            // 订阅 Session 事件，通知 UI
+            session.StateChanged += (s, state) =>
+            {
+                if (state == InlineDiffSessionState.Committed ||
+                    state == InlineDiffSessionState.Dismissed)
+                {
+                    PendingDiffCountChanged?.Invoke();
+                }
+            };
+
+            // 显示
+            _diffHost.Show(session);
+
+            PendingDiffCountChanged?.Invoke();
+            Logger.Info($"[EditorDiff] Inline Diff Session 已创建: {session.SessionId.Substring(0, 8)} ({Path.GetFileName(filePath)})");
+
+            return session;
+        }
+
+        /// <summary>
+        /// 获取活跃 Session 数量（新版）。
+        /// </summary>
+        public int GetActiveSessionCount() => _sessionManager.ActiveCount;
+
+        /// <summary>
+        /// 获取差异预览的数量（旧版活跃窗口 + 新版 Session）。
         /// </summary>
         public int GetActiveCount()
         {
@@ -162,7 +234,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 return _activeWindows.Count;
             }
         }
-
         #endregion
 
         #region Public API — Confirm / Undo
@@ -317,12 +388,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         #region Public API — Batch Operations
 
         /// <summary>
-        /// 全局确认：关闭所有活跃差异预览窗口，丢弃所有待处理 diff。
+        /// 全局确认：接受所有新版 Session 的变更，关闭所有旧版 diff 窗口，
+        /// 丢弃所有待处理 diff。
         /// </summary>
-        public void AcceptAllChanges()
+        public async void AcceptAllChanges()
         {
-            ThreadHelper.ThrowIfNotOnUIThread();
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
+            // 新版：接受所有 Session
+            await _sessionManager.AcceptAllAsync(CancellationToken.None);
+
+            // 旧版：关闭所有活跃窗口
             List<DiffViewerWindow> windows;
             lock (_windowsLock)
             {
@@ -348,17 +424,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             if (pendingCount > 0)
                 PendingDiffCountChanged?.Invoke();
 
-            Logger.Info($"[EditorDiff] 已全局确认: {windows.Count} 个活跃会话 + {pendingCount} 个待处理 diff");
+            Logger.Info($"[EditorDiff] 已全局确认: {windows.Count} 个旧版窗口 + {pendingCount} 个待处理 diff");
         }
 
         /// <summary>
-        /// 全局撤销：先回退所有活跃会话的缓冲区内容到原始代码，
-        /// 再关闭所有差异预览窗口，最后丢弃所有待处理 diff。
+        /// 全局撤销：新版 Session(s) + 旧版窗口 + 待处理 diff。
         /// </summary>
         public void UndoAllChanges()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
+            // 新版：撤销所有 Session
+            _sessionManager.DismissAll();
+
+            // 旧版：关闭所有活跃窗口
             List<DiffViewerWindow> windows;
             lock (_windowsLock)
             {
@@ -366,14 +445,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 _activeWindows.Clear();
             }
 
-            // ── 先触发每个窗口的撤销回调（回退缓冲区内容）──
             foreach (var window in windows)
             {
                 try { window.PerformUndo(); }
                 catch { /* ignore */ }
             }
 
-            // ── 再关闭所有窗口 ──
             foreach (var window in windows)
             {
                 try { window.Close(); }
@@ -390,7 +467,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             if (pendingCount > 0)
                 PendingDiffCountChanged?.Invoke();
 
-            Logger.Info($"[EditorDiff] 已全局撤销: {windows.Count} 个活跃会话已回退 + {pendingCount} 个待处理 diff 已丢弃");
+            Logger.Info($"[EditorDiff] 已全局撤销: {windows.Count} 个旧版窗口 + {pendingCount} 个待处理 diff");
         }
 
         #endregion
@@ -447,6 +524,16 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             {
                 Logger.Error($"[EditorDiff] 回退缓冲区失败: {ex.Message}", ex);
             }
+        }
+
+        /// <summary>
+        /// 从 ITextBuffer 获取关联的文件路径。
+        /// </summary>
+        private static string? GetFilePathFromBuffer(ITextBuffer buffer)
+        {
+            if (buffer.Properties.TryGetProperty(typeof(ITextDocument), out ITextDocument textDoc))
+                return textDoc.FilePath;
+            return null;
         }
 
         #endregion

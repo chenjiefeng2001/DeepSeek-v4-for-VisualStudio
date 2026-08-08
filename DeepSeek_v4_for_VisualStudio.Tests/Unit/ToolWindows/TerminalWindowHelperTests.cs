@@ -3,60 +3,13 @@ using DeepSeek_v4_for_VisualStudio.ToolWindows;
 namespace DeepSeek_v4_for_VisualStudio.Tests.Unit.ToolWindows;
 
 /// <summary>
-/// TerminalWindowHelper 单元测试 — 测试 SuppressDiffPreview 开关行为。
+/// TerminalWindowHelper 单元测试。
 /// 注意：WriteCodeToFileAsync / ApplyCodeToActiveDocumentAsync / ShowFinalDiffAsync
 /// 等公开方法深度依赖 VS SDK（ITextBuffer / IVsInvisibleEditor / IWpfTextView），
 /// 属于集成测试范畴。此处仅测试可独立验证的纯逻辑。
 /// </summary>
 public class TerminalWindowHelperTests
 {
-    #region SuppressDiffPreview
-
-    [Fact]
-    public void SuppressDiffPreview_DefaultValue_IsFalse()
-    {
-        // Reset to default before test
-        TerminalWindowHelper.SuppressDiffPreview = false;
-
-        TerminalWindowHelper.SuppressDiffPreview.Should().BeFalse();
-    }
-
-    [Fact]
-    public void SuppressDiffPreview_CanBeSetToTrue()
-    {
-        TerminalWindowHelper.SuppressDiffPreview = true;
-
-        TerminalWindowHelper.SuppressDiffPreview.Should().BeTrue();
-    }
-
-    [Fact]
-    public void SuppressDiffPreview_CanBeToggled()
-    {
-        TerminalWindowHelper.SuppressDiffPreview = true;
-        TerminalWindowHelper.SuppressDiffPreview.Should().BeTrue();
-
-        TerminalWindowHelper.SuppressDiffPreview = false;
-        TerminalWindowHelper.SuppressDiffPreview.Should().BeFalse();
-    }
-
-    [Fact]
-    public void SuppressDiffPreview_ThreadSafe_ReadWrite()
-    {
-        // Verify the static property can be read/written without exceptions
-        var act = () =>
-        {
-            TerminalWindowHelper.SuppressDiffPreview = true;
-            var val = TerminalWindowHelper.SuppressDiffPreview;
-            TerminalWindowHelper.SuppressDiffPreview = false;
-            return val;
-        };
-
-        act.Should().NotThrow();
-        act().Should().BeTrue();
-    }
-
-    #endregion
-
     #region Type Structure
 
     [Fact]

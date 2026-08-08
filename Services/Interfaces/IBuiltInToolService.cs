@@ -16,5 +16,11 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         /// <summary>执行指定的内置工具，返回执行结果；若不是内置工具则返回 null</summary>
         /// <param name="cancellationToken">可选取消令牌，传递给工具以支持停止按钮中断</param>
         Task<string?> ExecuteBuiltInToolAsync(string toolName, string argumentsJson, string? workspaceRoot = null, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// StagedEditWorkspace 引用（可选设置）。
+        /// 设置后，内置编辑工具（apply_patch / create_file）写入 Workspace 而非磁盘。
+        /// </summary>
+        Editing.StagedEditWorkspace? Workspace { get; set; }
     }
 }
