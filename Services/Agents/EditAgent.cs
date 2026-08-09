@@ -362,6 +362,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     step.Status = AgentStepStatus.InProgress;
                     NotifyPlanUpdated();
 
+                    // ── 记录本步骤开始前的累积思考长度，用于提取本步骤思考增量（供完成声明检测）──
+                    int reasoningBaseLength = _accumulatedReasoning?.Length ?? 0;
+
                     var L = LocalizationService.Instance;
                     AddLog("INFO", string.Format(L["agent.log.editStepExec"], step.Index, plan.Steps.Count, step.Title));
 
@@ -413,8 +416,11 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         // ── 将步骤摘要写入会话记忆（供 Ask Agent 最终汇总使用）──
                         await SaveStepSummaryToMemoryAsync(step, plan, context);
 
-                        // ── v1.1.10: 检测 AI 输出中声明的后续步骤完成情况 ──
-                        DetectAndAutoCompleteLaterSteps(step, plan);
+                        // ── v1.1.10: 检测 AI 输出中声明的后续步骤完成情况（含思考内容）──
+                        string stepThinking = _accumulatedReasoning != null && _accumulatedReasoning.Length > reasoningBaseLength
+                            ? _accumulatedReasoning.Substring(reasoningBaseLength)
+                            : "";
+                        DetectAndAutoCompleteLaterSteps(step, plan, stepThinking);
                     }
                 }
 
@@ -592,9 +598,22 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             }
             else
             {
-                string result = await CallAiLongAsync(Definition.SystemPrompt, stepPrompt, ct, maxTokens: 4096);
+                // ── 非代码/构建步骤：同样收集思考内容（供完成声明检测与 UI 渲染）──
+                var stepThinking = new System.Text.StringBuilder();
+                string result = await CallAiLongAsync(Definition.SystemPrompt, stepPrompt, ct, maxTokens: 4096,
+                    onThinking: thinking =>
+                    {
+                        stepThinking.Append(thinking);
+                        context.OnThinkingChunk?.Invoke(thinking);
+                    });
                 step.AiResponse = result;
                 step.ResultSummary = result;
+                if (stepThinking.Length > 0)
+                {
+                    if (!string.IsNullOrEmpty(_accumulatedReasoning))
+                        _accumulatedReasoning += "\n\n";
+                    _accumulatedReasoning += stepThinking.ToString();
+                }
             }
         }
 
@@ -626,6 +645,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             string workspaceRoot = context.SolutionPath ?? string.Empty;
             if (!string.IsNullOrEmpty(workspaceRoot) && System.IO.File.Exists(workspaceRoot))
                 workspaceRoot = System.IO.Path.GetDirectoryName(workspaceRoot) ?? workspaceRoot;
+
+            // ── 创建 / 重置 StagedEditWorkspace（须在 AI 工具循环之前！）──
+            // 工具循环中的 create_file / apply_patch 等会通过 WriteFile 登记 Baseline，
+            // 供 diff 预览和逐块撤销使用。若在此之后才初始化，工具编辑将走 BackupService 直接落盘，
+            // 不登记 hunks，导致 diff 无数据可显示。
+            _stagedWorkspace ??= new Editing.StagedEditWorkspace();
+            _stagedWorkspace.Discard(); // 清空上一轮残留
+
+            EnsureEditTools(workspaceRoot);
+            if (BuiltInTools != null)
+                BuiltInTools.Workspace = _stagedWorkspace;
 
             // ── AI 调用循环（支持格式重试）──
             // messages 在循环外声明，重试时复用前一次的完整对话上下文（含工具调用结果），
@@ -788,15 +818,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             // ── 保存原始文件内容（用于最终 diff 比较）──
             var originalContents = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var appliedResults = new List<EditApplyResult>();
-
-            // ── 创建 / 重置 StagedEditWorkspace（工具通过 Workspace 暂存，不直接写盘）──
-            _stagedWorkspace ??= new Editing.StagedEditWorkspace();
-            _stagedWorkspace.Discard(); // 清空上一轮残留
-
-            // ── 注入 Workspace 到 EditAgent 级工具 + 工具循环内置工具 ──
-            EnsureEditTools(workspaceRoot);
-            if (BuiltInTools != null)
-                BuiltInTools.Workspace = _stagedWorkspace;
 
             // ── operationType 提前声明（goto 路径需要可见）──
             var operationType = EditOperationType.ApplyPatch;
@@ -1189,12 +1210,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// 从 AI 响应中检测是否声明了后续步骤也已完成（v1.1.10）。
         /// 解析 AI 输出中的步骤完成声明（如"步骤2和3也完成了"/"also completed step 2"），
         /// 自动将对应步骤标记为 Completed。比文件级启发式更可靠，尤其适用于同文件多步骤场景。
+        /// v1.1.12: 支持范围式声明（"步骤1-6 已完成"），并合并扫描思考内容（thinkingContent），
+        /// 因为 AI 可能在思考过程中声明步骤完成而正式输出未提及。
         /// </summary>
-        private void DetectAndAutoCompleteLaterSteps(AgentStep completedStep, AgentTaskPlan plan)
+        private void DetectAndAutoCompleteLaterSteps(AgentStep completedStep, AgentTaskPlan plan, string? thinkingContent = null)
         {
-            if (string.IsNullOrWhiteSpace(completedStep.AiResponse)) return;
+            if (string.IsNullOrWhiteSpace(completedStep.AiResponse) && string.IsNullOrWhiteSpace(thinkingContent)) return;
 
-            string response = completedStep.AiResponse!;
+            // 检测范围：正式输出 + 思考内容（合并后同一套正则均生效）
+            string response = (completedStep.AiResponse ?? "") + "\n[思考内容]\n" + (thinkingContent ?? "");
             var autoCompletedIndices = new HashSet<int>();
 
             // 模式1: 中文 "步骤2、3也完成了" / "步骤2和3已完成" / "也完成了步骤2,3"

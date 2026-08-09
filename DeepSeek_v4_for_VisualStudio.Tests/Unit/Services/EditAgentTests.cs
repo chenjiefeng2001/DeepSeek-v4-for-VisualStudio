@@ -375,6 +375,92 @@ public class EditAgentTests
         plan.CurrentStepIndex.Should().Be(1);
     }
 
+    [Fact]
+    public void DetectAndAutoCompleteLaterSteps_ThinkingContent_DeclaresRange_CompletesAndAdvances()
+    {
+        // 场景：正式输出未提及后续步骤，但思考内容中声明了范围式完成
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 6)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"步骤{i}",
+                    Status = AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "第一步完成。";
+        const string thinking = "已经把所有文件都改好了，步骤1-6 已完成。";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan, thinking);
+
+        plan.Steps.Skip(1).Should().OnlyContain(s => s.Status == AgentStepStatus.Completed);
+        plan.CurrentStepIndex.Should().Be(6);
+    }
+
+    [Fact]
+    public void DetectAndAutoCompleteLaterSteps_ThinkingContent_ListDeclares_Completes()
+    {
+        // 场景：逗号/顿号分隔列表声明出现在思考内容中
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 4)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"步骤{i}",
+                    Status = AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "第一步完成。";
+        const string thinking = "步骤2、3也完成了，可以直接跳到第4步。";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan, thinking);
+
+        plan.Steps[1].Status.Should().Be(AgentStepStatus.Completed); // 2
+        plan.Steps[2].Status.Should().Be(AgentStepStatus.Completed); // 3
+        plan.Steps[3].Status.Should().Be(AgentStepStatus.Pending);   // 4 不受影响
+        plan.CurrentStepIndex.Should().Be(3);
+    }
+
+    [Fact]
+    public void DetectAndAutoCompleteLaterSteps_ThinkingContent_NoDeclaration_DoesNotAdvance()
+    {
+        // 场景：思考内容只是计划性表述，不应被误判为完成
+        var agent = new EditAgent(_apiService);
+        var plan = new AgentTaskPlan
+        {
+            Title = "Test Plan",
+            CurrentStepIndex = 1,
+            Steps = Enumerable.Range(1, 4)
+                .Select(i => new AgentStep
+                {
+                    Index = i,
+                    Title = $"步骤{i}",
+                    Status = AgentStepStatus.Pending,
+                })
+                .ToList(),
+        };
+        plan.Steps[0].Status = AgentStepStatus.InProgress;
+        plan.Steps[0].AiResponse = "第一步完成。";
+        const string thinking = "接下来打算执行步骤2和步骤3，然后步骤4。";
+
+        DetectAndAutoCompleteLaterStepsPublic(agent, plan.Steps[0], plan, thinking);
+
+        plan.Steps.Skip(1).Should().OnlyContain(s => s.Status == AgentStepStatus.Pending);
+        plan.CurrentStepIndex.Should().Be(1);
+    }
+
     #endregion
 
     [Fact]
@@ -398,11 +484,11 @@ public class EditAgentTests
 
     // ──────────── Reflection helpers for testing private methods ────────────
 
-    private static void DetectAndAutoCompleteLaterStepsPublic(EditAgent agent, AgentStep completedStep, AgentTaskPlan plan)
+    private static void DetectAndAutoCompleteLaterStepsPublic(EditAgent agent, AgentStep completedStep, AgentTaskPlan plan, string? thinkingContent = null)
     {
         var method = typeof(EditAgent).GetMethod("DetectAndAutoCompleteLaterSteps",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        method!.Invoke(agent, new object[] { completedStep, plan });
+        method!.Invoke(agent, new object[] { completedStep, plan, thinkingContent });
     }
 
     private static AgentTaskPlan CreateSingleStepPlanPublic(string userMessage)

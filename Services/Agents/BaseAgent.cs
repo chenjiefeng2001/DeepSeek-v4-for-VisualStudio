@@ -393,7 +393,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// <summary>
         /// 调用 AI 进行长回答（用于代码生成、分析等）。
         /// </summary>
-        protected async Task<string> CallAiLongAsync(string systemPrompt, string userPrompt, CancellationToken ct, int maxTokens = 4096, double? temperature = null, string? responseFormat = null)
+        protected async Task<string> CallAiLongAsync(string systemPrompt, string userPrompt, CancellationToken ct, int maxTokens = 4096, double? temperature = null, string? responseFormat = null, Action<string>? onThinking = null)
         {
             var messages = BuildContextAwareMessages(systemPrompt, userPrompt);
 
@@ -401,7 +401,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             // 🔑 传入完整工具集 + toolChoice:"none" 以保持 Prefix Cache 稳定
             await foreach (var chunk in _apiService.ChatStreamAsync(messages, TryGetFullToolSet(), ct, maxTokens, temperature: temperature, responseFormat: responseFormat, toolChoice: "none"))
             {
-                if (IsContentChunk(chunk))
+                if (chunk.StartsWith("[THINKING]"))
+                    onThinking?.Invoke(chunk.Substring(10));
+                else if (IsContentChunk(chunk))
                     sb.Append(chunk);
             }
             LogCacheHitRate();
@@ -422,7 +424,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             int maxTokens = 4096,
             string? toolChoice = null,
             double? temperature = null,
-            string? responseFormat = null)
+            string? responseFormat = null,
+            Action<string>? onThinking = null)
         {
             var messages = BuildContextAwareMessages(systemPrompt, userPrompt, extraSystemMessages);
 
@@ -430,7 +433,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             // 🔑 传入完整工具集以保持 Prefix Cache 稳定
             await foreach (var chunk in _apiService.ChatStreamAsync(messages, TryGetFullToolSet(), ct, maxTokens, toolChoice, temperature, responseFormat))
             {
-                if (IsContentChunk(chunk))
+                if (chunk.StartsWith("[THINKING]"))
+                    onThinking?.Invoke(chunk.Substring(10));
+                else if (IsContentChunk(chunk))
                     sb.Append(chunk);
             }
             LogCacheHitRate();
