@@ -285,7 +285,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                 }
 
                 // ── 创建备份 ──
-                if (!backups.ContainsKey(prepared.FilePath))
+                // ── 创建备份（仅直接写盘模式；Workspace 用撤销追踪替代）──
+                if (Workspace == null && !backups.ContainsKey(prepared.FilePath))
                 {
                     backups[prepared.FilePath] = BackupService.CreateBackup(prepared.FilePath);
                 }
@@ -295,9 +296,20 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                 {
                     if (Workspace != null)
                     {
-                        // 暂存到 Workspace，不写盘，不创建备份
+                        // Workspace 模式：直接落盘 + 撤销追踪（不创建文件备份）
                         Workspace.WriteFile(prepared.FilePath, finalContent);
                         fileResult.FinalContent = finalContent;
+
+                        // ── 同步更新 VS 编辑器缓冲区 ──
+                        try
+                        {
+                            await EditBufferApplier.ApplyEditsToOpenDocumentAsync(
+                                prepared.FilePath, prepared.GeneratedEdit.TextEdits);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn(LocalizationService.Instance.Format("tool.edit.vsUpdateFailed", ToolName, ex.Message));
+                        }
                     }
                     else
                     {

@@ -259,9 +259,39 @@ namespace DeepSeek_v4_for_VisualStudio.Services
 
             IContentType ct = _contentTypeRegistry!.GetContentType(contentType);
 
-            // 创建纯内存 buffer（不关联任何文件）
-            var baselineBuffer = _textBufferFactory!.CreateTextBuffer(baselineText ?? string.Empty, ct);
-            var proposalBuffer = _textBufferFactory.CreateTextBuffer(proposedText ?? string.Empty, ct);
+            // 创建左右两个 buffer（优先文件后端 buffer，兼容 FileEncoding 等第三方 margin 扩展）
+            ITextBuffer baselineBuffer;
+            ITextBuffer proposalBuffer;
+            string? tempBaselineFile = null;
+            string? tempProposalFile = null;
+
+            try
+            {
+                if (_textDocumentFactory != null)
+                {
+                    // 使用临时文件创建带 ITextDocument 的 buffer
+                    tempBaselineFile = WriteTempFile(baselineText ?? string.Empty);
+                    tempProposalFile = WriteTempFile(proposedText ?? string.Empty);
+
+                    var baselineDoc = _textDocumentFactory.CreateAndLoadTextDocument(tempBaselineFile, ct);
+                    var proposalDoc = _textDocumentFactory.CreateAndLoadTextDocument(tempProposalFile, ct);
+                    baselineBuffer = baselineDoc.TextBuffer;
+                    proposalBuffer = proposalDoc.TextBuffer;
+                }
+                else
+                {
+                    baselineBuffer = _textBufferFactory!.CreateTextBuffer(baselineText ?? string.Empty, ct);
+                    proposalBuffer = _textBufferFactory.CreateTextBuffer(proposedText ?? string.Empty, ct);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[DiffViewer] 创建文件后端 buffer 失败，回退内存 buffer: {ex.Message}");
+                baselineBuffer = _textBufferFactory!.CreateTextBuffer(baselineText ?? string.Empty, ct);
+                proposalBuffer = _textBufferFactory.CreateTextBuffer(proposedText ?? string.Empty, ct);
+                tempBaselineFile = null;
+                tempProposalFile = null;
+            }
 
             // 配置差异选项
             var diffOptions = new StringDifferenceOptions
@@ -316,7 +346,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 $"rightLines={proposalBuffer.CurrentSnapshot.LineCount})");
 
             return new DiffViewerHandle(
-                baselineBuffer, proposalBuffer, differenceBuffer, viewer);
+                baselineBuffer, proposalBuffer, differenceBuffer, viewer,
+                tempBaselineFile, tempProposalFile);
         }
 
         #endregion

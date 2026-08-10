@@ -230,13 +230,25 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
 
                 if (Workspace != null)
                 {
-                    // ── Workspace 模式：只计算不写盘 ──
+                    // ── Workspace 模式：直接落盘 + 撤销追踪 ──
                     result = ApplySinglePatch(patch, resolvedPath, currentContent);
 
                     if (result.Success && !string.IsNullOrEmpty(result.FinalContent))
                     {
-                        Workspace.WriteFile(resolvedPath,
-                            EditStringMatcher.NormalizeToCrLf(result.FinalContent));
+                        string normalizedContent = EditStringMatcher.NormalizeToCrLf(result.FinalContent);
+                        Workspace.WriteFile(resolvedPath, normalizedContent);
+
+                        // ── 同步更新 VS 编辑器缓冲区 ──
+                        try
+                        {
+                            await EditBufferApplier.ApplyEditsToOpenDocumentAsync(
+                                resolvedPath, result.AppliedEdits);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn(LocalizationService.Instance.Format(
+                                "tool.edit.vsUpdateFailed", ToolName, ex.Message));
+                        }
                     }
                 }
                 else

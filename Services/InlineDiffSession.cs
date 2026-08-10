@@ -60,19 +60,28 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         // ── Diff 视图组件 ──
 
         /// <summary>冻结的原始内容 Buffer（只读显示用）</summary>
-        public ITextBuffer BaselineDisplayBuffer { get; }
+        public ITextBuffer BaselineDisplayBuffer => ViewerHandle.BaselineBuffer;
 
         /// <summary>建议内容 Buffer（只读显示用）</summary>
-        public ITextBuffer ProposalBuffer { get; }
+        public ITextBuffer ProposalBuffer => ViewerHandle.ProposalBuffer;
 
         /// <summary>差异缓冲区</summary>
-        public IDifferenceBuffer DifferenceBuffer { get; }
+        public IDifferenceBuffer DifferenceBuffer => ViewerHandle.DifferenceBuffer;
 
         /// <summary>WPF 差异查看器</summary>
-        public IWpfDifferenceViewer Viewer { get; }
+        public IWpfDifferenceViewer Viewer => ViewerHandle.Viewer;
 
         /// <summary>Diff 视图句柄（统一管理缓冲区 + Viewer 生命周期）</summary>
-        public DiffViewerHandle ViewerHandle { get; }
+        public DiffViewerHandle ViewerHandle { get; private set; }
+
+        /// <summary>
+        /// 写穿模式的撤销追踪器（可选）。
+        /// 设置后：
+        /// - Commit → 调用 <see cref="Editing.StagedEditWorkspace.ConfirmAll"/>（保留磁盘内容）
+        /// - Dismiss → 调用 <see cref="Editing.StagedEditWorkspace.RestoreToBaseline"/>（恢复磁盘 Baseline）
+        /// 用于 Agent 直接落盘后由用户决定保留/撤销的场景。
+        /// </summary>
+        public Editing.StagedEditWorkspace? Workspace { get; set; }
 
         /// <summary>当前会话状态</summary>
         public InlineDiffSessionState State { get; private set; } = InlineDiffSessionState.Created;
@@ -103,13 +112,17 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             CommitTarget = commitTarget ?? throw new ArgumentNullException(nameof(commitTarget));
             ViewerHandle = viewerHandle ?? throw new ArgumentNullException(nameof(viewerHandle));
 
-            BaselineDisplayBuffer = viewerHandle.BaselineBuffer;
-            ProposalBuffer = viewerHandle.ProposalBuffer;
-            DifferenceBuffer = viewerHandle.DifferenceBuffer;
-            Viewer = viewerHandle.Viewer;
-
             SourceBuffer = sourceBuffer;
             SourceBaselineSnapshot = sourceBaselineSnapshot;
+        }
+
+        /// <summary>
+        /// 替换 ViewerHandle（逐块撤销后重新基于当前内容创建只读预览时使用）。
+        /// 调用方负责 Dispose 旧 handle。
+        /// </summary>
+        public void ReplaceViewerHandle(DiffViewerHandle newHandle)
+        {
+            ViewerHandle = newHandle ?? throw new ArgumentNullException(nameof(newHandle));
         }
 
         #endregion
@@ -162,6 +175,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                     result = await CommitTarget.CommitAsync(Change, cancellationToken);
                 }
 
+                // 确认提交后，若关联了写穿 Workspace，保留磁盘内容并清除撤销追踪
+                if (result.Success && Workspace != null)
+                {
+                    Workspace.ConfirmAll();
+                }
+
                 if (result.Success)
                     TransitionTo(InlineDiffSessionState.Committed);
                 else if (result.IsConflict)
@@ -180,7 +199,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         }
 
         /// <summary>
-        /// 撤销变更。仅关闭 Viewer，不修改任何文件。
+        /// 撤销变更。在写穿模式下，若关联了 Workspace 且尚未被其他操作确认，
+        /// 将磁盘恢复到 Baseline；否则仅关闭 Viewer。
         /// </summary>
         public void Dismiss()
         {
@@ -188,6 +208,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 State == InlineDiffSessionState.Committed ||
                 State == InlineDiffSessionState.Disposed)
                 return;
+
+            // ── 写穿模式：撤销 = 恢复磁盘到 Baseline ──
+            if (Workspace != null && Workspace.HasAnyTrackedChanges)
+            {
+                Workspace.RestoreToBaseline();
+            }
 
             TransitionTo(InlineDiffSessionState.Dismissed);
             Dispose();

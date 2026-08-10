@@ -165,7 +165,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         /// <param name="proposedContent">AI 建议的新代码</param>
         public InlineDiffSession? CreateInlineDiffPreview(
             IWpfTextView textView, string originalContent, string proposedContent,
-            IReadOnlyList<ProposedTextChange>? textChanges = null)
+            IReadOnlyList<ProposedTextChange>? textChanges = null,
+            Editing.StagedEditWorkspace? workspace = null)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -198,6 +199,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             {
                 Logger.Warn($"[EditorDiff] 无法创建 Session: {Path.GetFileName(filePath)}");
                 return null;
+            }
+
+            // ── 写穿模式：关联 Workspace，撤销时恢复磁盘 Baseline ──
+            if (workspace != null)
+            {
+                session.Workspace = workspace;
             }
 
             // 订阅 Session 事件，通知 UI

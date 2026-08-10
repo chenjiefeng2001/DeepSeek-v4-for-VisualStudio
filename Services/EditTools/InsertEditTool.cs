@@ -178,6 +178,18 @@ namespace DeepSeek_v4_for_VisualStudio.Services.EditTools
                     if (Workspace != null)
                     {
                         Workspace.WriteFile(resolvedPath, normalizedContent);
+
+                        // ── 同步更新 VS 编辑器缓冲区 ──
+                        try
+                        {
+                            await EditBufferApplier.ApplyEditsToOpenDocumentAsync(
+                                resolvedPath, result.AppliedEdits);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn(LocalizationService.Instance.Format(
+                                "tool.edit.vsUpdateFailed", ToolName, ex.Message));
+                        }
                     }
                     else
                     {

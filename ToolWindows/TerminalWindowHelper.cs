@@ -25,11 +25,15 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
         /// <summary>
         /// 在流程结束时统一显示一次最终 diff 预览。
         /// 比较原始内容和最终内容，在编辑器中激活差异标记。
+        /// 由于 Agent 编辑已【直接落盘】，撤销时通过 workspace 恢复磁盘到 Baseline。
         /// </summary>
         /// <param name="oldContent">修改前的内容（新建文件传空字符串）</param>
-        /// <param name="newContent">修改后的最终内容</param>
+        /// <param name="newContent">修改后的最终内容（当前磁盘内容）</param>
         /// <param name="filePath">文件完整路径</param>
-        public static async Task ShowFinalDiffAsync(string oldContent, string newContent, string filePath)
+        /// <param name="workspace">StagedEditWorkspace（直接落盘模式的撤销追踪器，可选）</param>
+        public static async Task ShowFinalDiffAsync(
+            string oldContent, string newContent, string filePath,
+            Services.Editing.StagedEditWorkspace? workspace = null)
         {
             if (oldContent == newContent) return;
 
@@ -43,13 +47,21 @@ namespace DeepSeek_v4_for_VisualStudio.ToolWindows
                 var wpfView = FindWpfTextViewForFile(filePath);
                 if (wpfView != null)
                 {
-                    EditorDiffMarkerService.Instance.BeginDiffPreview(wpfView, oldContent, newContent);
-                    Logger.Info($"[WriteCode] 最终 diff 预览已激活: {Path.GetFileName(filePath)}");
+                    // 使用 preview-then-commit 路径（只读 diff），撤销时恢复磁盘 Baseline
+                    var session = EditorDiffMarkerService.Instance.CreateInlineDiffPreview(
+                        wpfView, oldContent, newContent,
+                        textChanges: null,
+                        workspace: workspace);
+
+                    if (session != null)
+                    {
+                        Logger.Info($"[WriteCode] 最终 diff 预览已激活: {Path.GetFileName(filePath)}");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Logger.Warn($"[WriteCode] 激活最终 diff 预览失败: {ex.Message}");
+                Logger.Error($"[WriteCode] 激活最终 diff 预览失败: {ex.Message}", ex);
             }
         }
 
