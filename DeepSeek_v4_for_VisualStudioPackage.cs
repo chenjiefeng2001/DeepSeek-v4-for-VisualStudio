@@ -17,7 +17,6 @@ using System.Threading.Tasks;
 namespace DeepSeek_v4_for_VisualStudio
 {
     /// <summary>
-    /// VS 包入口点，对标共享项目 VisuallChatGPTStudioPackage。
     /// 使用传统 VS SDK (AsyncPackage + ToolWindowPane)。
     /// </summary>
     [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
@@ -197,11 +196,61 @@ namespace DeepSeek_v4_for_VisualStudio
         }
 
         /// <summary>
-        /// 获取选项页。优先返回 Step 2/7 中已缓存的实例，
-        /// 避免重复调用 GetDialogPage（VS 2026 中可能阻塞）。
+        /// 获取运行时配置。Package 初始化阶段只提供内存默认值；
+        /// 持久化配置由 LoadPersistedOptionsAsync 在 Shell 空闲后加载。
         /// </summary>
-        public DeepSeekOptionsPage Options => DeepSeekOptionsPage.Instance ?? 
-            (DeepSeekOptionsPage)(DeepSeekOptionsPage.Instance = (DeepSeekOptionsPage)GetDialogPage(typeof(DeepSeekOptionsPage)));
+        public DeepSeekOptionsPage Options => DeepSeekOptionsPage.Instance ??= new DeepSeekOptionsPage();
+
+        private readonly object _persistedOptionsLock = new();
+        private Task<DeepSeekOptionsPage>? _persistedOptionsLoadTask;
+
+        /// <summary>
+        /// Loads the persisted DialogPage after package initialization has unwound.
+        /// GetDialogPage synchronously queries Unified Settings and deadlocks if called
+        /// while VS is still blocked waiting for InitializeAsync to complete.
+        /// </summary>
+        public Task<DeepSeekOptionsPage> LoadPersistedOptionsAsync()
+        {
+            lock (_persistedOptionsLock)
+            {
+                _persistedOptionsLoadTask ??= LoadPersistedOptionsCoreAsync();
+                return _persistedOptionsLoadTask;
+            }
+        }
+
+        private async Task<DeepSeekOptionsPage> LoadPersistedOptionsCoreAsync()
+        {
+            if (DisposalToken.IsCancellationRequested)
+            {
+                return Options;
+            }
+
+            try
+            {
+                // Leave the current package-load/command-execution stack before
+                // touching DialogPage so AsyncPackage initialization can finish.
+                await Task.Yield();
+                await KnownUIContexts.ShellInitializedContext;
+                await JoinableTaskFactory.SwitchToMainThreadAsync(DisposalToken);
+
+                DiagnosticLog.Write("[DeepSeek Init] Loading persisted options after package initialization...");
+                var persistedOptions = (DeepSeekOptionsPage)GetDialogPage(typeof(DeepSeekOptionsPage));
+                DeepSeekOptionsPage.Instance = persistedOptions;
+                InitializeLocalization();
+                ThemeService.Instance.UserThemeMode = persistedOptions.ThemeMode;
+                DiagnosticLog.Write("[DeepSeek Init] Persisted options loaded OK");
+                return persistedOptions;
+            }
+            catch (OperationCanceledException)
+            {
+                return Options;
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write($"[DeepSeek Init] Persisted options load deferred/failed: {ex.GetType().Name}: {ex.Message}");
+                return Options;
+            }
+        }
 
         #region Package Members
 
@@ -237,49 +286,12 @@ namespace DeepSeek_v4_for_VisualStudio
                 throw;
             }
 
-            // ═══ 步骤 3/8：选项页 ═══
-            // VS 2026 中 GetDialogPage() 可能在设置存储未就绪时无限阻塞，
-            // 导致 VS 启动卡死。添加 5 秒超时保护，超时后使用内存回退实例。
-            try
-            {
-                DeepSeekOptionsPage? opts = null;
-                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                try
-                {
-                    opts = await Task.Run(() => (DeepSeekOptionsPage)GetDialogPage(typeof(DeepSeekOptionsPage)), cts.Token);
-                }
-                catch (OperationCanceledException)
-                {
-                    DiagnosticLog.Write("[DeepSeek Init] Step 3/8 GetDialogPage timed out after 5s — VS settings store may not be ready in VS 2026");
-                }
-
-                if (opts != null)
-                {
-                    DeepSeekOptionsPage.Instance = opts;
-                    DiagnosticLog.Write("[DeepSeek Init] Step 3/8: Options page OK");
-                }
-                else
-                {
-                    // 回退：创建内存实例，确保插件不因设置存储不可用而完全失效
-                    DeepSeekOptionsPage.Instance = new DeepSeekOptionsPage();
-                    DiagnosticLog.Write("[DeepSeek Init] Step 2/7: Options page FALLBACK (in-memory instance, settings will not persist this session)");
-                }
-            }
-            catch (Exception ex)
-            {
-                DiagnosticLog.Write($"[DeepSeek Init] Step 3/8 Options (non-fatal): {ex.GetType().Name}: {ex.Message}");
-                // 非致命：创建回退实例
-                try
-                {
-                    DeepSeekOptionsPage.Instance = new DeepSeekOptionsPage();
-                    DiagnosticLog.Write("[DeepSeek Init] Step 3/8: Options page FALLBACK after exception");
-                }
-                catch (Exception ex2)
-                {
-                    DiagnosticLog.Write($"[DeepSeek Init] FATAL Step 3/8 fallback creation: {ex2.GetType().Name}: {ex2.Message}");
-                    throw;
-                }
-            }
+            // ═══ 步骤 3/8：选项页默认值 ═══
+            // GetDialogPage must not run here: restoring its settings synchronously
+            // queries Unified Settings while VS is waiting for this package to finish
+            // initializing, which creates a UI-thread deadlock.
+            DeepSeekOptionsPage.Instance ??= new DeepSeekOptionsPage();
+            DiagnosticLog.Write("[DeepSeek Init] Step 3/8: in-memory defaults ready; persisted options deferred");
 
             // ═══ 步骤 4/8：日志系统 ═══
             try
@@ -380,6 +392,7 @@ namespace DeepSeek_v4_for_VisualStudio
 
                         // 2. 打开 DeepSeek Chat 工具窗口
                         DiagnosticLog.Write("[DeepSeek Init] Toast 点击：正在打开工具窗口...");
+                        await LoadPersistedOptionsAsync();
                         await ShowToolWindowAsync(
                             typeof(DeepSeekChatWindowPane),
                             0,
@@ -419,6 +432,8 @@ namespace DeepSeek_v4_for_VisualStudio
 
                 try
                 {
+                    DiagnosticLog.Write("[DeepSeek Init] Auto-show: loading persisted options...");
+                    await LoadPersistedOptionsAsync();
                     DiagnosticLog.Write("[DeepSeek Init] Auto-show: calling ShowToolWindowAsync...");
                     await ShowToolWindowAsync(typeof(DeepSeekChatWindowPane), 0, create: true, cancellationToken: DisposalToken);
                     DiagnosticLog.Write("[DeepSeek Init] Auto-show: tool window shown OK");

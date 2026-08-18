@@ -28,12 +28,12 @@ namespace DeepSeek_v4_for_VisualStudio.Commands
         /// </summary>
         public static readonly Guid CommandSet = new Guid("A1B2C3D4-E5F6-7890-ABCD-EF1234567890");
 
-        private readonly AsyncPackage _package;
+        private readonly DeepSeek_v4_for_VisualStudioPackage _package;
 
         /// <summary>
         /// 初始化命令并注册两个入口点到菜单服务。
         /// </summary>
-        private ShowChatWindowCommand(AsyncPackage package, OleMenuCommandService commandService)
+        private ShowChatWindowCommand(DeepSeek_v4_for_VisualStudioPackage package, OleMenuCommandService commandService)
         {
             _package = package ?? throw new ArgumentNullException(nameof(package));
             commandService = commandService ?? throw new ArgumentNullException(nameof(commandService));
@@ -57,7 +57,7 @@ namespace DeepSeek_v4_for_VisualStudio.Commands
         /// <summary>
         /// 初始化命令（由 Package.InitializeAsync 调用）。
         /// </summary>
-        public static async System.Threading.Tasks.Task InitializeAsync(AsyncPackage package)
+        public static async System.Threading.Tasks.Task InitializeAsync(DeepSeek_v4_for_VisualStudioPackage package)
         {
             DiagnosticLog.Write("[DeepSeek Cmd] InitializeAsync: starting...");
             try
@@ -96,6 +96,8 @@ namespace DeepSeek_v4_for_VisualStudio.Commands
             {
                 try
                 {
+                    DiagnosticLog.Write("[DeepSeek Cmd] Execute: loading persisted options...");
+                    await _package.LoadPersistedOptionsAsync();
                     DiagnosticLog.Write("[DeepSeek Cmd] Execute: calling ShowToolWindowAsync...");
                     await _package.ShowToolWindowAsync(
                         typeof(View.DeepSeekChatWindowPane),
