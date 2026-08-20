@@ -101,48 +101,37 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             // 终端与构建
             "run_in_terminal",
             "get_terminal_output",
-            "create_and_run_task",
             "build_solution",
             // Git 版本控制
             "git",
             // 子代理委派与移交
             "runSubagent",
             "request_handoff",
-            // 任务与记忆
-            "manage_todo_list",
+            // 记忆
             "memory",
             // 用户交互
             "VisualStudio_askQuestions",  // 向用户提问澄清
         };
 
         /// <summary>
-        /// Edit Agent 代码步骤专用探索工具集。
-        /// AI 在编写代码前使用 runSubagent 委派 ExploreAgent 探索项目结构，
-        /// 配合 read_file（利用缓存命中）和 get_errors 完成上下文收集。
-        /// </summary>
-        private static readonly string[] ExplorationTools = new[]
-        {
-            "read_file",
-            "get_errors",
-            "runSubagent",
-            "build_solution",      // 允许探索阶段编译验证当前代码状态
-            "git",                 // 允许探索阶段使用 git 查看状态/历史
-        };
-
-        /// <summary>
         /// Edit Agent 代码步骤完整工具集（v1.1.10）。
         /// 包含探索工具 + 编辑工具，允许 AI 在步骤内执行增量编辑：
         /// 探索 → 编辑 → 读取结果 → 继续编辑 → ...，而非强制一次性输出所有变更。
-        /// 不包含 build_solution：编译由步骤后的验证阶段或 Planning 最终构建统一触发，避免重复构建。
+        /// 不包含 build_solution / request_handoff：编译和后续移交由系统统一触发，避免代码步骤内抢占流程。
         /// 循环检测机制（BaseAgent.CallAiWithToolLoopAsync）防止死循环。
         /// </summary>
         private static readonly string[] CodeStepTools = new[]
         {
             // 探索工具
             "read_file",
+            "file_search",
+            "grep_search",
+            "symbol_search",
+            "list_dir",
             "get_errors",
             "runSubagent",
             "git",
+            "run_in_terminal",
             // 编辑工具 — 允许步骤内增量编辑
             "replace_string_in_file",
             "multi_replace_string_in_file",
@@ -150,11 +139,45 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             "delete_file",
             "apply_patch",
             "create_directory",
-            "edit_notebook_file",
             // 记忆工具 — 允许步骤内读写持久记忆
             "memory",
+            "VisualStudio_askQuestions",  // 向用户提问澄清
         };
 
+        /// <summary>
+        /// Edit Agent 编译验证阶段工具清单（build + 只读 + 编辑 + 记忆，不含探索/子代理工具）。
+        /// </summary>
+        private static readonly string[] VerifyPhaseTools = new[]
+        {
+            "build_solution",
+            "read_file",
+            "get_errors",
+            "replace_string_in_file",
+            "multi_replace_string_in_file",
+            "create_file",
+            "apply_patch",
+            "delete_file",
+            "create_directory",
+            "run_in_terminal",
+            "get_terminal_output",
+            "memory",
+            "git",                   // 解决冲突后重试推送等 git 操作
+        };
+
+        /// <summary>
+        /// 只读执行阶段工具：允许读取、搜索和运行终端命令，但不允许任何文件写入。
+        /// </summary>
+        private static readonly string[] ReadOnlyExecutionTools = new[]
+        {
+            "read_file",
+            "file_search",
+            "grep_search",
+            "symbol_search",
+            "list_dir",
+            "run_in_terminal",
+            "get_terminal_output",
+            "VisualStudio_askQuestions",
+        };
         protected override AgentDefinition CreateDefinition(AgentType agentType)
         {
             return new AgentDefinition
@@ -200,7 +223,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         private static string BuildSystemPrompt()
         {
             return LocalizationService.Instance["system.agent.editPromptFragment"]
-                + LocalizationService.Instance["agent.edit.mcpSystemPrompt"];
+                + LocalizationService.Instance["agent.edit.mcpSystemPrompt"]
+                + LocalizationService.Instance["system.agent.editBuildTrustRule"]
+                + LocalizationService.Instance["system.agent.editPhaseToolOverride"];
         }
 
         #endregion
@@ -280,8 +305,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             if (!string.IsNullOrEmpty(_accumulatedReasoning))
                 result.ReasoningContent = _accumulatedReasoning;
 
-            // ── 构建执行结果摘要（Content），使 Handoff 合并时 UI 可见执行结果 ──
-            result.Content = BuildExecutionSummary(result.Plan);
+            // ── 构建最终回复内容（Content）──
+            // 纯只读/终端任务无文件变更时直接沿用 AI 的最终回复（例如“输出代码内容”），
+            // 避免后续被“变更总结”形式的 Handoff 覆盖；有文件变更时仍是执行结果摘要。
+            result.Content = BuildFinalContent(result.Plan, result.Handoff == null);
 
             result.Logs.AddRange(_logs);
             return result;
@@ -461,26 +488,30 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         NotifyPlanUpdated();
                         try
                         {
-                            string finalBuildResult;
-                            if (BuiltInTools != null)
+                            string finalBuildResult = await ExecuteDirectBuildAsync(
+                                LocalizationService.Instance["agent.log.editFinalBuildStepTitle"],
+                                context.SolutionPath,
+                                _agentCts?.Token ?? context.CancellationToken);
+                            LogDirectBuildResult(finalBuildResult);
+
+                            // ── 最终构建通过后回写步骤状态，避免旧编译失败污染总结 ──
+                            if (!HasBuildFailure(finalBuildResult))
                             {
-                                finalBuildResult = await BuiltInTools.ExecuteBuiltInToolAsync(
-                                    "build_solution", "{}", context.SolutionPath,
-                                    _agentCts?.Token ?? context.CancellationToken)
-                                    ?? LocalizationService.Instance["agent.log.editBuildToolNoResult"];
+                                int reconciled = PlanBuildOutcomeReconciler.ReconcileAfterBuildSuccess(
+                                    plan,
+                                    finalBuildResult,
+                                    LocalizationService.Instance["agent.log.buildReconciledStepResult"]);
+                                if (reconciled > 0)
+                                {
+                                    AddLog("INFO", string.Format(
+                                        LocalizationService.Instance["agent.log.buildReconciledSteps"],
+                                        reconciled));
+                                }
+
+                                // 状态回写后计划可能恢复为已完成，刷新最终摘要记忆
+                                if (plan.IsCompleted && !plan.IsCancelled)
+                                    await SaveFinalPlanSummaryToMemoryAsync(plan, context);
                             }
-                            else
-                            {
-                                finalBuildResult = await ExecuteBuildStepAsync(
-                                    new AgentStep { Title = LocalizationService.Instance["agent.log.editFinalBuildStepTitle"] }, context.SolutionPath,
-                                    _agentCts.Token);
-                            }
-                            string oneLine = finalBuildResult.Split(new[] { '\r', '\n' },
-                                StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? finalBuildResult;
-                            if (finalBuildResult.Contains("✅") || finalBuildResult.Contains("0 个错误") || finalBuildResult.Contains("0 errors"))
-                                AddLog("INFO", string.Format(LocalizationService.Instance["agent.log.editFinalBuildOk"], oneLine));
-                            else
-                                AddLog("WARN", string.Format(LocalizationService.Instance["agent.log.editFinalBuildWarn"], oneLine));
                         }
                         catch (Exception ex)
                         {
@@ -554,47 +585,32 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             }
 
             // ── 判断步骤类型 ──
-            bool isCodeStep = IsCodeWritingStep(step.Title);
-            bool isBuildStep = IsBuildOrRunStep(step.Title);
+            bool isBuildStep = IsBuildVerificationStep(step.Title);
+            bool isReadOnlyExecutionStep = plan.Intent == AgentIntent.QandA
+                && IsReadOnlyExecutionRequest(step.Description);
+            bool isCodeStep = !isReadOnlyExecutionStep && IsCodeWritingStep(step.Title);
 
             // ── 构建 AI prompt ──
             string stepPrompt = BuildStepPrompt(step, plan, context, isCodeStep);
 
             if (isBuildStep)
             {
-                // ── 使用 build_solution 工具（统一通过 BuiltInToolService 构建）──
-                string buildResult;
-                if (BuiltInTools != null)
-                {
-                    buildResult = await BuiltInTools.ExecuteBuiltInToolAsync(
-                        "build_solution", "{}", context.SolutionPath, ct)
-                        ?? LocalizationService.Instance["agent.log.editBuildToolNoResult"];
-                }
-                else
-                {
-                    buildResult = await ExecuteBuildStepAsync(step, context.SolutionPath, ct);
-                }
+                // ── 直接构建：计划中的构建/运行/测试步骤统一走 build_solution ──
+                string buildResult = await ExecuteDirectBuildAsync(
+                    step.Title, context.SolutionPath, ct);
                 step.AiResponse = buildResult;
                 step.ResultSummary = buildResult;
 
                 // ── 记录构建结果到日志，使 HasBuildWarningsInLogs() 能检测到步骤级构建失败 ──
-                if (buildResult.Contains("❌") || buildResult.Contains("error CS") || buildResult.Contains("error C")
-                    || buildResult.Contains("Build FAILED") || buildResult.Contains("0 succeeded"))
-                {
-                    string oneLine = buildResult.Split(new[] { '\r', '\n' },
-                        StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? buildResult;
-                    AddLog("WARN", string.Format(LocalizationService.Instance["agent.log.editFinalBuildWarn"], oneLine));
-                }
-                else
-                {
-                    string oneLine = buildResult.Split(new[] { '\r', '\n' },
-                        StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? buildResult;
-                    AddLog("INFO", string.Format(LocalizationService.Instance["agent.log.editFinalBuildOk"], oneLine));
-                }
+                LogDirectBuildResult(buildResult);
             }
             else if (isCodeStep)
             {
                 await ExecuteCodeStepAsync(step, plan, context, stepPrompt, ct);
+            }
+            else if (isReadOnlyExecutionStep)
+            {
+                await ExecuteReadOnlyExecutionStepAsync(step, context, stepPrompt, ct);
             }
             else
             {
@@ -670,6 +686,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             var retryOutputs = new List<string>();
             List<ChatApiMessage>? messages = null;
             int stepPromptIndex = 0; // 步骤 prompt 在消息列表中的位置（重试时插入点）
+            int stepToolLoopStart = 0; // 当前步骤工具循环新增消息的起点（排除转发/历史消息）
 
             for (int retry = 0; retry <= maxFormatRetries; retry++)
             {
@@ -680,6 +697,9 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     // 首次尝试：创建全新的消息列表
                     messages = BuildContextAwareMessages(Definition.SystemPrompt, stepPrompt);
                     stepPromptIndex = messages.Count - 1; // 步骤 prompt 始终是最后一条
+                    // 工具循环会把 assistant/tool 消息插入到末尾 agent 提示与用户消息之前。
+                    // 因此基线必须指向 agent 提示之前，而不是消息列表末尾。
+                    stepToolLoopStart = Math.Max(0, messages.Count - 2);
                 }
                 else
                 {
@@ -737,7 +757,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 if (IsNoChangesResponse(result))
                 {
                     // ── 但如果本轮有工具调用完成了编辑，则不视为空响应 ──
-                    if (!HasToolMadeEdits(messages!))
+                    if (!HasToolMadeEdits(GetStepToolLoopMessages(messages!, stepToolLoopStart)))
                     {
                         AddLog("INFO", LocalizationService.Instance["agent.log.editEmptyResponse"]);
                         result = string.Empty; // 统一置空，后续流程据此跳过编辑
@@ -749,7 +769,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 // ── v1.1.10: 检测本轮是否通过工具完成了文件编辑 ──
                 // 如果 AI 已在工具循环中直接修改了文件，则无需格式重试，
                 // 文本回复视为操作总结而非编辑格式输出。
-                bool hasToolEditsThisRound = HasToolMadeEdits(messages!);
+                bool hasToolEditsThisRound = HasToolMadeEdits(GetStepToolLoopMessages(messages!, stepToolLoopStart));
                 if (hasToolEditsThisRound)
                 {
                     AddLog("INFO", "[EditAgent] 检测到步骤内工具编辑，跳过编辑格式校验");
@@ -759,7 +779,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 // ── 纯 Git/终端操作跳过格式校验 ──
                 // 如果本轮所有工具调用都是 git/终端/构建（无代码读取/编辑），
                 // AI 的文本回复是操作总结而非编辑输出，无需格式重试。
-                if (IsGitOrTerminalOnlyResult(messages!))
+                if (IsGitOrTerminalOnlyResult(GetStepToolLoopMessages(messages!, stepToolLoopStart)))
                 {
                     AddLog("INFO", "[EditAgent] 纯 Git/终端操作，跳过编辑格式校验");
                     break;
@@ -800,7 +820,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             // ── v1.1.10: 提取工具循环中通过工具完成的文件编辑 ──
             // AI 可以在步骤内使用 replace_string_in_file / create_file 等工具增量编辑，
             // 而非强制一次性输出所有变更。此处从消息历史中提取编辑记录。
-            var toolMadeEdits = ExtractToolMadeEdits(messages!);
+            var toolMadeEdits = ExtractToolMadeEdits(GetStepToolLoopMessages(messages!, stepToolLoopStart));
             bool hasToolEdits = toolMadeEdits.Count > 0;
             if (hasToolEdits)
             {
@@ -994,7 +1014,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 }
             }
 
-            // ── 编译验证阶段（AI 可使用完整 EditTools，包括 build_solution）──
+            // ── 编译修复阶段：构建失败时由 AI 读取错误并直接修复 ──
             // v1.1.12: 当用户关闭自动编译或在提示中要求跳过时，跳过整个验证阶段
             if (changes.Count > 0 && !ct.IsCancellationRequested && !context.IsPlanningMode
                 && !ShouldSkipAutoBuild())
@@ -1011,18 +1031,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     string.Join("\n", changes.Select(c => $"- `{c.FilePath}`")));
 
                 // ── 验证阶段专用工具白名单：build + 只读 + 编辑工具（不含探索工具）──
-                var verifyToolWhitelist = new List<string>
-                {
-                    "build_solution",
-                    "read_file",
-                    "get_errors",
-                    "replace_string_in_file",
-                    "multi_replace_string_in_file",
-                    "create_file",
-                    "run_in_terminal",
-                    "get_terminal_output",
-                    "git",                   // 解决冲突后重试推送等 git 操作
-                };
+                var verifyToolWhitelist = new List<string>(VerifyPhaseTools);
 
                 // ── 将验证专用指令作为额外 system 消息注入，保持 messages[0] 不变 ──
                 var verifyExtraSystemMessages = new List<ChatApiMessage>
@@ -1991,15 +2000,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 {
                     string name = tc.Function?.Name ?? "";
                     if (name == "git" || name == "run_in_terminal" ||
-                        name == "get_terminal_output" || name == "build_solution" ||
-                        name == "create_and_run_task")
+                        name == "get_terminal_output" || name == "build_solution")
                     {
                         hasGitOrTerminal = true;
                     }
                     else if (name == "read_file" || name == "replace_string_in_file" ||
                              name == "create_file" || name == "delete_file" ||
-                             name == "multi_replace_string_in_file" || name == "apply_patch" ||
-                             name == "insert_edit_into_file" || name == "edit_notebook_file")
+                             name == "multi_replace_string_in_file" || name == "apply_patch")
                     {
                         hasCodeTool = true;
                     }
@@ -2045,6 +2052,27 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// 检测本轮消息中是否包含编辑类工具调用（replace_string_in_file / create_file 等）。
         /// 如果 AI 已在工具循环中直接修改了文件，则无需再通过文本格式输出编辑块。
         /// </summary>
+        /// <summary>
+        /// 截取当前步骤工具循环期间新增的消息（排除 Handoff/上下文中历史工具调用）。
+        /// 防止历史中的 create_file 等调用被误判为本轮“工具编辑”。
+        /// </summary>
+        private static List<ChatApiMessage> GetStepToolLoopMessages(
+            List<ChatApiMessage> messages, int startIndex)
+        {
+            if (messages == null || messages.Count == 0 || startIndex < 0)
+                return new List<ChatApiMessage>();
+            if (startIndex >= messages.Count)
+                return new List<ChatApiMessage>();
+
+            int count = messages.Count - startIndex;
+            var slice = new List<ChatApiMessage>(count);
+            for (int i = startIndex; i < messages.Count; i++)
+            {
+                slice.Add(messages[i]);
+            }
+            return slice;
+        }
+
         private static bool HasToolMadeEdits(List<ChatApiMessage> messages)
         {
             foreach (var msg in messages)
@@ -2059,8 +2087,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         name == "create_file" ||
                         name == "delete_file" ||
                         name == "apply_patch" ||
-                        name == "create_directory" ||
-                        name == "edit_notebook_file")
+                        name == "create_directory")
                     {
                         return true;
                     }
@@ -2248,9 +2275,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         #region Build Step
 
         /// <summary>
-        /// 判断步骤是否为构建/运行/验证类。
+        /// 判断步骤是否应直接触发构建验证。
+        /// “运行/测试”步骤目前没有独立测试执行器，先统一归入构建验证路径。
         /// </summary>
-        private static bool IsBuildOrRunStep(string stepTitle)
+        private static bool IsBuildVerificationStep(string stepTitle)
         {
             if (string.IsNullOrWhiteSpace(stepTitle)) return false;
             var buildKeywords = new[] { "运行", "验证", "构建", "编译", "测试运行", "执行测试",
@@ -2259,25 +2287,54 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         }
 
         /// <summary>
-        /// 执行构建/运行步骤。
-        /// 委托给 BuildService 统一处理（支持 .sln 和 CMake/Open Folder）。
+        /// 直接执行 build_solution（支持 .sln 和 CMake/Open Folder）。
+        /// 计划中的显式构建步骤和 Planning 最终构建共用此入口。
         /// </summary>
-        private async Task<string> ExecuteBuildStepAsync(AgentStep step, string? solutionPath, CancellationToken ct)
+        private async Task<string> ExecuteDirectBuildAsync(
+            string stepTitle, string? solutionPath, CancellationToken ct)
         {
-            AddLog("INFO", LocalizationService.Instance.Format("agent.log.editStepStart", step.Title));
+            AddLog("INFO", LocalizationService.Instance.Format("agent.log.editStepStart", stepTitle));
 
             try
             {
-                var buildService = new BuildService();
-                string result = await buildService.BuildAsync(solutionPath, ct);
-                Logger.Info($"[EditAgent] 构建完成: {(result.Length > 200 ? result.Substring(0, 200) + "..." : result)}");
-                return result;
+                string? result;
+                if (BuiltInTools != null)
+                {
+                    result = await BuiltInTools.ExecuteBuiltInToolAsync(
+                        "build_solution", "{}", solutionPath, ct);
+                }
+                else
+                {
+                    var buildService = new BuildService();
+                    result = await buildService.BuildAsync(solutionPath, ct);
+                }
+
+                string buildResult = result ?? LocalizationService.Instance["agent.log.editBuildToolNoResult"];
+                Logger.Info($"[EditAgent] 构建完成: {(buildResult.Length > 200 ? buildResult.Substring(0, 200) + "..." : buildResult)}");
+                return buildResult;
             }
             catch (Exception ex)
             {
                 Logger.Warn($"[EditAgent] 构建异常: {ex.Message}");
                 return string.Format(LocalizationService.Instance["agent.log.editBuildFailed"], ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 记录直接构建结果。成功/失败标记缺失时按警告处理，避免把不可判定结果误报为成功。
+        /// </summary>
+        private void LogDirectBuildResult(string buildResult)
+        {
+            string oneLine = buildResult.Split(new[] { '\r', '\n' },
+                StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? buildResult;
+
+            bool success = buildResult.Contains("✅")
+                || buildResult.Contains("0 个错误")
+                || buildResult.Contains("0 errors");
+            if (success)
+                AddLog("INFO", string.Format(LocalizationService.Instance["agent.log.editFinalBuildOk"], oneLine));
+            else
+                AddLog("WARN", string.Format(LocalizationService.Instance["agent.log.editFinalBuildWarn"], oneLine));
         }
 
         #endregion
@@ -2345,6 +2402,23 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             sb.AppendLine(string.Format(LocalizationService.Instance["agent.step.currentStepPrompt"], step.Index, plan.Steps.Count, step.Title));
             sb.AppendLine($"步骤详情: {step.Description}");
             sb.AppendLine();
+
+            if (isCodeStep)
+            {
+                var stageTools = new List<string>(CodeStepTools);
+                if (McpManager != null)
+                {
+                    stageTools.AddRange(GetAutoMcpToolNames(McpManager, Definition.Type));
+                }
+                stageTools = stageTools
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                sb.AppendLine(string.Format(
+                    AiPrompts.EditCodeStepToolGuidance,
+                    string.Join(", ", stageTools)));
+                sb.AppendLine();
+            }
 
             // ── 注入 plan.md 概述 + 当前步骤对应章节 ──
             string? planFilePath = context.PlanFilePath ?? plan.PlanFilePath;
@@ -2875,21 +2949,185 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
 
         private static AgentTaskPlan CreateSingleStepPlan(string userMessage)
         {
+            bool isReadOnlyExecution = IsReadOnlyExecutionRequest(userMessage);
+            string stepTitle = isReadOnlyExecution
+                ? LocalizationService.Instance["agent.step.executeReadOnlyCommand"]
+                : LocalizationService.Instance["agent.step.analyzeAndModify"];
+
             return new AgentTaskPlan
             {
-                Intent = AgentIntent.CodeChange,
-                Title = LocalizationService.Instance["agent.step.executeCodeChange"],
+                Intent = isReadOnlyExecution ? AgentIntent.QandA : AgentIntent.CodeChange,
+                Title = isReadOnlyExecution
+                    ? LocalizationService.Instance["agent.step.executeReadOnlyCommand"]
+                    : LocalizationService.Instance["agent.step.executeCodeChange"],
                 Steps = new List<AgentStep>
                 {
                     new AgentStep
                     {
                         Index = 1,
-                        Title = LocalizationService.Instance["agent.step.analyzeAndModify"],
+                        Title = stepTitle,
                         Description = userMessage,
                         RequiresApproval = false,
                     }
                 },
             };
+        }
+
+        /// <summary>
+        /// 识别“运行命令以读取/输出内容”的只读执行请求。
+        /// 这类任务允许执行终端命令，但禁止任何文件写入，避免把输出内容误落地为代码文件。
+        /// </summary>
+        private static bool IsReadOnlyExecutionRequest(string? message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            string text = message.Trim();
+
+            bool hasExecutionIntent =
+                text.Contains("运行", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("执行", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("终端命令", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("python", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("powershell", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("script", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("run ", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("execute ", StringComparison.OrdinalIgnoreCase);
+
+            bool hasReadOrOutputIntent =
+                text.Contains("读取", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("读出", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("查看", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("显示", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("输出", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("打印", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("read ", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("output ", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("print ", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("show ", StringComparison.OrdinalIgnoreCase);
+
+            bool hasWriteIntent =
+                text.Contains("修改", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("更改", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("创建", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("新建", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("写入", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("保存", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("替换", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("删除", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("实现", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("修复", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("create", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("write", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("save", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("modify", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("change", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("update", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("delete", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("fix", StringComparison.OrdinalIgnoreCase);
+
+            return hasExecutionIntent && hasReadOrOutputIntent && !hasWriteIntent;
+        }
+
+        /// <summary>
+        /// 执行只读命令/读取任务：保留终端能力，但禁用所有文件编辑工具。
+        /// </summary>
+        private async Task ExecuteReadOnlyExecutionStepAsync(
+            AgentStep step,
+            AgentContext context,
+            string stepPrompt,
+            CancellationToken ct)
+        {
+            string workspaceRoot = context.SolutionPath ?? string.Empty;
+            if (!string.IsNullOrEmpty(workspaceRoot) && File.Exists(workspaceRoot))
+                workspaceRoot = Path.GetDirectoryName(workspaceRoot) ?? workspaceRoot;
+
+            var promptBuilder = new StringBuilder(stepPrompt);
+            promptBuilder.AppendLine();
+            promptBuilder.AppendLine("## 只读执行约束（最高优先级）");
+            promptBuilder.AppendLine("- 本任务是读取或输出内容，只能使用读取、搜索和终端执行工具。");
+            promptBuilder.AppendLine("- 严禁创建、修改、删除、保存任何文件；不要调用 create_file、replace_string_in_file、apply_patch、delete_file。");
+            promptBuilder.AppendLine("- 你可以对执行过程或元信息做简要说明，但用户明确要求输出的内容必须完整保留。");
+            promptBuilder.AppendLine("- 如果用户要求输出代码或文件内容，必须包含完整原文；不得只给摘要、说明或“已输出”的状态描述。");
+
+            var messages = BuildContextAwareMessages(Definition.SystemPrompt, promptBuilder.ToString());
+            int toolLoopStart = Math.Max(0, messages.Count - 2);
+            var thinkingBuilder = new StringBuilder();
+            string result = await CallAiWithToolLoopAsync(
+                messages,
+                workspaceRoot,
+                ct,
+                maxTokens: 8192,
+                toolWhitelist: new List<string>(ReadOnlyExecutionTools),
+                onThinking: thinking =>
+                {
+                    thinkingBuilder.Append(thinking);
+                    context.OnThinkingChunk?.Invoke(thinking);
+                },
+                onContent: content => context.OnContentChunk?.Invoke(content),
+                onToolCall: toolSummary => AddLog("INFO", toolSummary));
+
+            // 只读输出任务优先返回工具原始结果，避免模型把文件内容再总结一遍。
+            var rawToolOutput = GetStepToolLoopMessages(messages, toolLoopStart)
+                .LastOrDefault(m =>
+                    m.Role == "tool" &&
+                    (string.Equals(m.Name, "run_in_terminal", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(m.Name, "read_file", StringComparison.OrdinalIgnoreCase)))
+                ?.Content;
+
+            step.AiResponse = BuildReadOnlyExecutionContent(result, rawToolOutput);
+            step.ResultSummary = LocalizationService.Instance["agent.log.readOnlyExecutionCompleted"];
+
+            if (thinkingBuilder.Length > 0)
+            {
+                if (!string.IsNullOrEmpty(_accumulatedReasoning))
+                    _accumulatedReasoning += "\n\n";
+                _accumulatedReasoning += thinkingBuilder.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 组装只读执行结果：允许 AI 做简要加工，但保证用户要求的原始输出不缺失。
+        /// </summary>
+        private static string BuildReadOnlyExecutionContent(
+            string? aiResult,
+            string? rawToolOutput)
+        {
+            string summary = aiResult?.Trim() ?? string.Empty;
+            string raw = rawToolOutput?.Trim() ?? string.Empty;
+
+            if (raw.Length == 0)
+                return summary;
+
+            if (summary.Length == 0)
+                return raw;
+
+            // AI 已经完整携带原始输出时，不再重复附加。
+            if (ContainsNormalized(summary, raw))
+                return summary;
+
+            return summary
+                + "\n\n--- 完整终端输出 ---\n"
+                + raw
+                + "\n--- 完整终端输出结束 ---";
+        }
+
+        private static bool ContainsNormalized(string haystack, string needle)
+        {
+            if (string.IsNullOrEmpty(haystack) || string.IsNullOrEmpty(needle))
+                return false;
+
+            string Normalize(string value)
+            {
+                return value
+                    .Replace("\r\n", "\n")
+                    .Replace("\r", "\n")
+                    .Trim();
+            }
+
+            return Normalize(haystack).Contains(
+                Normalize(needle),
+                StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -2955,6 +3193,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             // ── AI 动态移交优先 ──
             if (PendingHandoffRequest != null)
                 return ConvertHandoffRequestToHandoff(PendingHandoffRequest);
+
+            // ── 纯只读/终端任务（未产生文件变更且无构建警告）：不再移交 Ask 生成“变更总结”──
+            // 直接返回 Edit Agent 的最终回复作为结果（例如用户要求运行命令并输出内容）。
+            // 这样最终回复是实际内容，而不是被「文件变更总结」覆盖。
+            if (plan.ChangedFiles.Count == 0 && !HasBuildWarningsInLogs())
+            {
+                AddLog("INFO", LocalizationService.Instance["agent.log.editNoChangesConfirmed"]);
+                return null;
+            }
 
             // ── 检查是否应跳过自动编译 ──
             bool skipBuild = ShouldSkipAutoBuild();
@@ -3122,6 +3369,22 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             }
 
             return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// 构建最终回复内容：纯只读/终端任务（无文件变更）直接沿用 AI 的最终回复，
+        /// 避免被“变更总结”形式的 Handoff 覆盖；有文件变更时仍使用执行结果摘要。
+        /// </summary>
+        private string BuildFinalContent(AgentTaskPlan plan, bool hasNoFileChanges)
+        {
+            if (!hasNoFileChanges)
+                return BuildExecutionSummary(plan);
+
+            var completedStep = plan.Steps.LastOrDefault(s => s.Status == AgentStepStatus.Completed);
+            if (completedStep != null && !string.IsNullOrWhiteSpace(completedStep.AiResponse))
+                return completedStep.AiResponse.Trim();
+
+            return BuildExecutionSummary(plan);
         }
 
         #endregion

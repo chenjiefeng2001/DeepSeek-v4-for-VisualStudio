@@ -38,8 +38,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             "fetch_webpage", "build_solution", "replace_string_in_file", "multi_replace_string_in_file",
             "create_file", "delete_file", "apply_patch", "create_directory", "run_in_terminal",
             "get_terminal_output", "VisualStudio_askQuestions", "runSubagent", "request_handoff",
-            "git", "memory", "search", "get_changed_files", "github_repo", "manage_todo_list",
-            "create_and_run_task", "edit_notebook_file"
+            "git", "memory"
         };
 
         /// <summary>读类 MCP 工具名前缀/关键词（分配给 ExploreAgent）</summary>
@@ -538,12 +537,13 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         ///   messages[1] = fixedPrompt（会话级上下文，session 内不变）
         ///   messages[2] = dynamicBlock（压缩摘要 + 搜索 + RAG + 记忆）
         ///   messages[3..N] = 对话历史（来自 ContextManager，起始位置固定）
-        ///   messages[N+1] = Agent 专属行为指令（末尾，每次注入位置随历史长度变化）
-        ///   messages[N+2] = 当前用户消息
+        ///   messages[N+1] = 当前用户消息
+        ///   messages[N+2] = Agent 专属行为指令（固定在最后）
         /// 
-        /// 设计决策：Agent 提示词放在历史之后、用户消息之前。虽然位置随历史增长
-        /// 而漂移（自身每次 miss），但历史 [3..] 起始位置固定，重叠部分始终命中。
-        /// Handoff 时 ForwardedMessages 原封不动复用整个前缀，新 Agent 仅追加。
+        /// 设计决策：Agent 提示词固定在列表最后，用户消息放在它之前。这样工具循环
+        /// 新增的 assistant/tool 消息都在用户消息前向上漂移，Agent 提示词位置不再
+        /// 随轮次漂移；历史 [3..] 起始位置固定的前缀缓存命中范围更大。
+        /// Handoff 时同样复用旧前缀，追加新用户消息和新 Agent 提示词。
         /// </summary>
         /// <param name="systemPrompt">Agent 专属行为指令（不含共享前缀）</param>
         /// <param name="userPrompt">当前的用户消息/步骤描述</param>
@@ -561,22 +561,21 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 Context!.ForwardedMessages = null; // 消费后清空，防止下次误用
                 var result = new List<ChatApiMessage>(forwarded);
 
-                // ── 🔑 v1.1.11：替换末尾旧 Agent 提示词 + 用户消息，而非追加 ──
-                // 工具循环 Insert 模式保证 forwarded 末尾始终是 [agent] + [user]，
-                // 新 Agent 直接替换这两个位置，避免出现两条提示词。
+                // ── 新结构：旧前缀 + [当前用户] + [当前 Agent 提示词] ──
+                // 仅移除源 Agent 末尾提示词，旧用户消息和历史保留，目标 Agent 提示词追加到最后。
                 int count = result.Count;
-                if (count >= 2)
+                if (count >= 1 && result[count - 1].Role == "system")
                 {
-                    result[count - 2] = new ChatApiMessage { Role = "system", Content = systemPrompt ?? string.Empty };
-                    result[count - 1] = new ChatApiMessage { Role = "user", Content = userPrompt };
+                    result.RemoveAt(count - 1);
                 }
-                else
+                else if (count >= 2 && result[count - 2].Role == "system" && result[count - 1].Role == "user")
                 {
-                    // 异常短列表，回退到追加模式
-                    if (!string.IsNullOrWhiteSpace(systemPrompt))
-                        result.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
-                    result.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+                    // 兼容旧结构：尾部 [agent] + [user] 一并移除
+                    result.RemoveRange(count - 2, 2);
                 }
+                result.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+                if (!string.IsNullOrWhiteSpace(systemPrompt))
+                    result.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
                 return result;
             }
 
@@ -602,13 +601,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 }
             }
 
-            // ── 第4层：Agent 专属行为指令（历史之后、用户消息之前）──
-            //     位置随历史长度变化，自身每次 miss，但历史 [3..] 起始位置固定，
-            //     跨轮次重叠部分始终命中。Handoff 时 ForwardedMessages 走独立路径。
-            if (!string.IsNullOrWhiteSpace(systemPrompt))
-                messages.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
-
-            // ── 第4.5层：易变上下文（Working Set + RAG，放在 Agent 指令之后）──
+            // ── 第4层：易变上下文（Working Set + RAG，放在用户消息之前）──
             //     这些内容每轮都可能变（读不同文件、不同 query 的 RAG 结果），
             //     放在消息末尾以最大化前面前缀缓存的命中范围。
             if (ctxManager != null)
@@ -618,8 +611,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     messages.Add(new ChatApiMessage { Role = "system", Content = volatileBlock });
             }
 
-            // ── 第5层：当前用户消息（变化最大，放在最后）──
+            // ── 第5层：当前用户消息 ──
             messages.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+
+            // ── 第6层：Agent 专属行为指令（固定在最后）──
+            if (!string.IsNullOrWhiteSpace(systemPrompt))
+                messages.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
 
             return messages;
         }
@@ -627,7 +624,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
         /// <summary>
         /// 构建上下文感知的消息列表（支持注入额外的系统级上下文）。
         /// 
-        /// extraSystemMessages 插入在用户消息之前（Agent 提示词之后）。
+        /// extraSystemMessages 插入在用户消息之前，Agent 提示词仍固定在最后。
         /// 前缀结构 [0..2] 与主重载一致，确保 DeepSeek Prefix Cache 跨路径共享。
         /// </summary>
         protected List<ChatApiMessage> BuildContextAwareMessages(
@@ -639,8 +636,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             var messages = BuildContextAwareMessages(systemPrompt, userPrompt, maxRecentTurns);
 
             // ── 在用户消息之前注入额外的 system 消息 ──
-            // 用户消息始终是最后一条，insertPos = Count-1 即插入在用户消息之前
-            int insertPos = messages.Count - 1; // 用户消息之前
+            // 结构为 [prefix][volatile][user][agent]，用户消息在倒数第二位。
+            int insertPos = Math.Max(0, messages.Count - 2);
             if (extraSystemMessages != null && extraSystemMessages.Count > 0)
             {
                 messages.InsertRange(insertPos, extraSystemMessages);
@@ -682,11 +679,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             var callSignatureHistory = new List<string>();
             var toolCallHistory = new List<(int Round, string Summary)>();
             var lastResultBySignature = new Dictionary<string, string>();  // 跟踪每次调用的结果
+            var rejectedToolNames = new List<string>();
+            int rejectedToolRounds = 0;
             int consecutiveErrorRounds = 0;
             int maxRepeatedSameCall = Settings.DeepSeekOptionsPage.Instance?.MaxRepeatedSameCall ?? 5;
             if (maxRepeatedSameCall < 1) maxRepeatedSameCall = 5;
             int maxConsecutiveErrors = Settings.DeepSeekOptionsPage.Instance?.MaxConsecutiveErrors ?? 5;
             if (maxConsecutiveErrors < 1) maxConsecutiveErrors = 5;
+            int maxConsecutiveWhitelistRejections = Math.Max(5, maxConsecutiveErrors);
             int safetyLimit = Settings.DeepSeekOptionsPage.Instance?.MaxToolCallRounds ?? 200;
             if (safetyLimit < 1) safetyLimit = 200;
             bool loopDetected = false;
@@ -694,10 +694,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             int round = BuiltInTools?.CurrentRound ?? 0;
 
             // ── 🔑 v1.1.11：固定后缀插入点 ──
-            // 消息结构：[0..3]prefix + [4..]历史 + [tool_calls...] + [agent] + [user]
-            // 工具循环中新增消息插入到 [agent] 之前，保持 [agent]+[user] 始终在末尾。
-            // ForwardedMessages 捕获此结构后，新 Agent 可直接替换末尾 [agent]+[user]。
-            int toolInsertPos = Math.Max(0, messages.Count - 2);
+            // 消息结构：[0..3]prefix + [4..]历史 + [volatile] + [user] + [tool_calls...] + [agent]
+            // 工具循环中新增 assistant/tool 插入到 user 之后、agent 之前，
+            // 保持 agent 固定在最后，user 留在工具结果之前。
+            int toolInsertPos = Math.Max(0, messages.Count - 1);
             while (!loopDetected)
             {
                 round++;
@@ -721,8 +721,11 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 // 🔑 Prefix Cache 优化：始终发送完整工具集（所有内置 + MCP 工具），
                 //    保持 tools JSON 跨 Agent/阶段不变，最大化 DeepSeek Prefix Cache 命中率。
                 //    工具调用由客户端按白名单拦截（见下方拦截逻辑）。
+                //    白名单为空表示明确"不允许任何工具"：此时显式传 tool_choice:"none"，
+                //    避免模型看到 read_file 等定义后误调用，被拦截后污染最终输出。
                 List<ToolDefinition>? toolDefs = null;
                 List<string>? effectiveWhitelist = null;
+                string? toolChoice = null;
                 if (BuiltInTools != null || McpManager != null)
                 {
                     // ── 始终发送完整工具集（不对 tools JSON 做白名单过滤）──
@@ -735,8 +738,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     {
                         var modifyingTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                         {
-                            "replace_string_in_file", "create_file", "create_directory", 
-                            "edit_notebook_file", "delete_file", "apply_patch", 
+                            "replace_string_in_file", "create_file", "create_directory",
+                            "delete_file", "apply_patch",
                             "run_in_terminal", "write_file", "edit_file"
                         };
                         effectiveWhitelist = effectiveWhitelist.Where(t => !modifyingTools.Contains(t)).ToList();
@@ -753,8 +756,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         }
                     }
 
+                    if (effectiveWhitelist != null && effectiveWhitelist.Count == 0)
+                    {
+                        toolChoice = "none";
+                    }
+
                     Logger.Info($"[Agent:{Definition.Name}] 本轮携带 {toolDefs.Count} 个工具定义(完整集)" +
-                        (toolWhitelist != null ? $", 白名单={effectiveWhitelist?.Count ?? 0}个" : ""));
+                        (toolWhitelist != null ? $", 白名单={effectiveWhitelist?.Count ?? 0}个" : "") +
+                        (toolChoice == "none" ? ", toolChoice=none" : ""));
                 }
 
                 // ── 流式调用 AI（带断点续传重试）──
@@ -795,14 +804,14 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                             Logger.Info($"[Agent:{Definition.Name}] 流断点续传：第 {streamAttempt + 1}/{maxStreamAttempts} 次，已注入 {savedPartialContent.Length} 字符部分内容");
 
                             // 使用 resume 消息而不是原始消息
-                            await foreach (var chunk in _apiService.ChatStreamAsync(resumeMessages, toolDefs, ct))
+                            await foreach (var chunk in _apiService.ChatStreamAsync(resumeMessages, toolDefs, ct, toolChoice: toolChoice))
                             {
                                 ProcessStreamChunk(chunk, reasoningBuilder, contentBuilder, toolCallAccumulator, onThinking, onContent);
                             }
                         }
                         else
                         {
-                            await foreach (var chunk in _apiService.ChatStreamAsync(messages, toolDefs, ct))
+                            await foreach (var chunk in _apiService.ChatStreamAsync(messages, toolDefs, ct, toolChoice: toolChoice))
                             {
                                 ProcessStreamChunk(chunk, reasoningBuilder, contentBuilder, toolCallAccumulator, onThinking, onContent);
                             }
@@ -990,9 +999,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 // ── 🔑 客户端白名单拦截：标记不在 effectiveWhitelist 中的工具调用 ──
                 //    因为 API 请求始终发送完整工具集（Prefix Cache 优化），
                 //    AI 可能调用不在当前 Agent/阶段白名单中的工具。
-                //    标记后统一在执行阶段返回拒绝消息，让 AI 重试正确工具。
+                //    标记后统一在执行阶段返回拒绝消息，并终止本轮工具循环。
                 HashSet<int>? blockedToolIndices = null;
-                if (toolCalls.Count > 0 && effectiveWhitelist != null && effectiveWhitelist.Count > 0)
+                bool rejectedToolThisRound = false;
+                if (toolCalls.Count > 0 && effectiveWhitelist != null)
                 {
                     var whitelistSet = new HashSet<string>(effectiveWhitelist, StringComparer.OrdinalIgnoreCase);
                     blockedToolIndices = new HashSet<int>();
@@ -1006,6 +1016,11 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     if (blockedToolIndices.Count > 0)
                     {
                         var blockedNames = string.Join(", ", blockedToolIndices.Select(i => toolCalls[i].Function.Name));
+                        rejectedToolNames.AddRange(toolCalls
+                            .Where((tc, i) => blockedToolIndices.Contains(i))
+                            .Select(tc => tc.Function.Name));
+                        rejectedToolRounds++;
+                        rejectedToolThisRound = true;
                         Logger.Warn($"[Agent:{Definition.Name}] 🚫 白名单拦截 {blockedToolIndices.Count} 个工具: {blockedNames}（白名单: {string.Join(", ", effectiveWhitelist)}）");
                     }
                 }
@@ -1064,7 +1079,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     }
 
                     // ── 添加 assistant 消息（含工具调用）──
-                    // 🔑 v1.1.11：插入到 [agent] 之前，保持末尾固定
+                    // 🔑 v1.1.11：插入到 user 之后、agent 之前
                     messages.Insert(toolInsertPos, new ChatApiMessage
                     {
                         Role = "assistant",
@@ -1100,10 +1115,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                                 ? string.Join(", ", effectiveWhitelist)
                                 : "无";
                             return Task.FromResult(
-                                $"🚫 工具 '{tc.Function.Name}' 在当前 Agent/阶段不可用。\n" +
+                                $"❌ 工具 '{tc.Function.Name}' 在当前 Agent/阶段不可用。\n" +
                                 $"原因：该工具不在当前白名单中。\n" +
                                 $"当前可用工具: {allowedList}\n" +
-                                $"请使用可用工具重试，或考虑将任务移交给合适的 Agent。");
+                                "这是确定性配置错误，不要重复调用该工具。\n" +
+                                "请改用当前可用工具继续；如果任务无法在当前 Agent 完成，" +
+                                (effectiveWhitelist.Contains("request_handoff", StringComparer.OrdinalIgnoreCase)
+                                    ? "请立即调用 request_handoff 移交给合适的 Agent。"
+                                    : "请直接说明无法完成的原因。") +
+                                "\n再次发生白名单外工具调用将终止本轮工具循环。");
                         }
                         var timeout = GetToolTimeout(tc.Function.Name);
                         return ExecuteToolWithTimeoutAsync(tc, workspaceRoot, ct, timeout);
@@ -1142,7 +1162,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         // ── 裁剪工具结果以保护上下文（与 ContextManager.AddToolResult 保持一致）──
                         string contextResult = CompactToolResultForAgent(tc.Function.Name, toolResult);
 
-                        // ── 🔑 runSubagent 结果放到末尾（[agent] 之后、[user] 之前），
+                        // ── 🔑 runSubagent 结果放到 [user] 之后、[agent] 之前，
                         //     保持前缀不被破坏，确保 DeepSeek Prefix Cache 跨轮次命中。──
                         if (tc.Function.Name == "runSubagent")
                         {
@@ -1176,12 +1196,34 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         Logger.Info($"[Agent:{Definition.Name}] 工具 {tc.Function.Name} 返回: {(toolResult.Length > 200 ? toolResult.Substring(0, 200) + "..." : toolResult)}");
                     }
 
+                    // 合法工具轮次说明模型已纠正，重置连续白名单拒绝计数。
+                    if (!rejectedToolThisRound)
+                    {
+                        rejectedToolRounds = 0;
+                    }
+
+                    // ── 连续多轮白名单拒绝才终止，避免大型任务偶发误调用被过早中断 ──
+                    if (rejectedToolRounds >= maxConsecutiveWhitelistRejections && PendingHandoffRequest == null)
+                    {
+                        loopDetected = true;
+                        PendingHandoffRequest = null;
+                        var distinctRejectedTools = string.Join(", ", rejectedToolNames.Distinct(StringComparer.OrdinalIgnoreCase));
+                        Logger.Warn($"[Agent:{Definition.Name}] 🚫 连续 {rejectedToolRounds} 轮白名单拒绝，终止工具循环: {distinctRejectedTools}");
+
+                        var terminatedBuilder = new StringBuilder().Append(contentBuilder);
+                        terminatedBuilder.Append($"\n\n> ⚠️ 连续 {rejectedToolRounds} 轮调用白名单外工具: {distinctRejectedTools}。");
+                        terminatedBuilder.Append("\n> 已终止工具循环。请检查阶段工具配置后重新发起任务。");
+                        contentBuilder.Clear();
+                        contentBuilder.Append(terminatedBuilder.ToString());
+                        break;
+                    }
+
                     // ── 🔑 Explore 子代理消息注入（v1.1.11）：将 Explore 内部工具循环消息
                     //     回注到父 Agent 的 messages 列表，确保后续轮次从 ContextManager
                     //     重建时前缀结构完全一致。
                     //     Explore 执行期间通过 AddAssistantMessage/AddToolResult 写入
                     //     ContextManager 的消息，在此刻读出。
-                    //     🔑 v1.1.12：注入到 messages 末尾（[agent] 之后、[user] 之前），
+                    //     🔑 v1.1.12：注入到 [user] 之后、[agent] 之前，
                     //     与 runSubagent 工具结果同位置，保持前缀不被破坏以最大化缓存命中。──
                     if (toolCalls.Any(tc => tc.Function.Name == "runSubagent")
                         && Context?.ContextManager != null)
@@ -1218,8 +1260,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         {
                             Context.ForwardedMessages = new List<ChatApiMessage>(messages);
                         }
-                        if (contentBuilder.Length > 0)
-                            contentBuilder.Append("\n\n> 🔄 任务已移交给 " + PendingHandoffRequest.TargetAgent + " Agent...");
+                        contentBuilder.Append("\n\n> 🔄 任务已移交给 " + PendingHandoffRequest.TargetAgent + " Agent...");
                         break;
                     }
 
@@ -1264,6 +1305,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                             {
                                 // 结果相同 → 真正的死循环，终止
                                 loopDetected = true;
+                                PendingHandoffRequest = null;
                                 Logger.Warn($"[Agent:{Definition.Name}] 🔄 检测到循环调用: {toolName} 已重复 {repeatCount} 次且每次返回相同结果");
 
                                 var terminatedBuilder = new StringBuilder();
@@ -1341,6 +1383,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                         if (consecutiveErrorRounds >= maxConsecutiveErrors)
                         {
                             loopDetected = true;
+                            PendingHandoffRequest = null;
                             Logger.Warn($"[Agent:{Definition.Name}] 🔄 连续 {consecutiveErrorRounds} 轮工具调用全部返回错误，强制结束");
 
                             // ── 附加上次 AI 的上下文总结和最后一次工具调用结果摘要 ──
@@ -2376,9 +2419,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 "VisualStudio_askQuestions", "runSubagent", "tool_result",
                 "file_search", "grep_search", "list_dir", "read_file",
                 "semantic_search", "fetch_webpage", "run_in_terminal",
-                "create_file", "replace_string_in_file", "edit_notebook_file",
-                "create_directory", "run_notebook_cell", "install_python_packages",
-                "runSubagent", "runTests", "mcp_\\w+", "github_\\w+",
+                "create_file", "replace_string_in_file",
+                "create_directory", "runSubagent", "mcp_\\w+", "github_\\w+",
                 // DeepSeek V4 DSML wrapper tags
                 "response", "result", "output", "answer"
             };
@@ -2682,7 +2724,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 or "create_file"
                 or "apply_patch"
                 or "build_solution"          // 构建时间不可预测，由 BuildService 内部控制超时
-                or "create_and_run_task"     // 自定义任务同理
                 or "read_file"               // 可能触发项目外路径权限弹窗
                 or "list_dir"                // 同上
                 or "create_directory"        // 同上
@@ -2783,8 +2824,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             {
                 "write_file" => true,
                 "create_file" => true,
-                "replace_in_file" => true,
-                "multi_replace_in_file" => true,
+                "replace_string_in_file" => true,
+                "multi_replace_string_in_file" => true,
                 "delete_file" => true,
                 "apply_patch" => true,
                 "create_directory" => true,
@@ -2897,7 +2938,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                 }
 
                 // ── 编辑类工具的 special 字段 ──
-                // replace_in_file: oldFilePath → 返回 filePath（主文件）
+                // replace_string_in_file: oldFilePath → 返回 filePath（主文件）
                 // apply_patch: filePath 已被覆盖
                 // create_directory: dirPath 已被覆盖
             }
