@@ -414,7 +414,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
             };
 
             // 初始化模型和推理强度下拉框
-            ModelComboBox.ItemsSource = new[] { "deepseek-v4-pro", "deepseek-v4-flash" };
+            ModelComboBox.ItemsSource = DeepSeekModelCatalog.All;
             ModelComboBox.SelectedIndex = 0;
 
             EffortComboBox.ItemsSource = new[] { "high", "max" };

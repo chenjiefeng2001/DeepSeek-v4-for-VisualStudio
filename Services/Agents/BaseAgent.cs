@@ -546,6 +546,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             {
                 Role = m.Role,
                 Content = m.Content,
+                MultimodalContent = m.MultimodalContent,
                 ReasoningContent = m.ReasoningContent,
                 ToolCalls = m.ToolCalls?
                     .Select(tc => new ToolCall
@@ -625,7 +626,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
                     // 兼容旧结构：尾部 [agent] + [user] 一并移除
                     result.RemoveRange(count - 2, 2);
                 }
-                result.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+                result.Add(CreateCurrentUserMessage(userPrompt));
                 if (!string.IsNullOrWhiteSpace(systemPrompt))
                     result.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
                 return result;
@@ -664,13 +665,38 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             }
 
             // ── 第5层：当前用户消息 ──
-            messages.Add(new ChatApiMessage { Role = "user", Content = userPrompt });
+            messages.Add(CreateCurrentUserMessage(userPrompt));
 
             // ── 第6层：Agent 专属行为指令（固定在最后）──
             if (!string.IsNullOrWhiteSpace(systemPrompt))
                 messages.Add(new ChatApiMessage { Role = "system", Content = systemPrompt });
 
             return messages;
+        }
+
+        /// <summary>
+        /// 创建当前用户消息。视觉模型场景下，把 VisionContent 图片块和用户文本
+        /// 合成为 OpenAI 兼容的 content 数组。
+        /// </summary>
+        private ChatApiMessage CreateCurrentUserMessage(string userPrompt)
+        {
+            var message = new ChatApiMessage
+            {
+                Role = "user",
+                Content = userPrompt,
+            };
+
+            if (Context?.VisionContent is { Count: > 0 } visionParts)
+            {
+                var parts = new List<ChatContentPart>
+                {
+                    new ChatContentPart { Type = "text", Text = userPrompt },
+                };
+                parts.AddRange(visionParts);
+                message.MultimodalContent = parts;
+            }
+
+            return message;
         }
 
         /// <summary>
@@ -2365,6 +2391,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services.Agents
             {
                 Role = m.Role,
                 Content = m.Content,
+                MultimodalContent = m.MultimodalContent,
                 ReasoningContent = m.ReasoningContent,
                 ToolCalls = m.ToolCalls,
                 ToolCallId = m.ToolCallId,

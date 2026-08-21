@@ -149,6 +149,13 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         [JsonIgnore]
         public Services.ConversationContextManager? ContextManager { get; set; }
 
+        /// <summary>
+        /// 当前用户消息附带的视觉内容块（仅 deepseek-v4-flash-vision-exp 使用）。
+        /// BaseAgent 会把它们和当前用户文本合成为 content 数组。
+        /// </summary>
+        [JsonIgnore]
+        public List<ChatContentPart>? VisionContent { get; set; }
+
         /// <summary>文件读取回调</summary>
         [JsonIgnore]
         public Func<string, Task<string?>>? ReadFileAsync { get; set; }

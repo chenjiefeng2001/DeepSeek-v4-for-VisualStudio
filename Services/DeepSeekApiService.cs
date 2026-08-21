@@ -1,4 +1,4 @@
-using DeepSeek_v4_for_VisualStudio.Models;
+﻿using DeepSeek_v4_for_VisualStudio.Models;
 using DeepSeek_v4_for_VisualStudio.Utils;
 using System;
 using System.Collections.Generic;
@@ -568,6 +568,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 {
                     Role = msg.Role,
                     Content = msg.Content,
+                    MultimodalContent = msg.MultimodalContent,
                     ReasoningContent = msg.ReasoningContent,
                     ToolCalls = msg.ToolCalls,
                     ToolCallId = msg.ToolCallId,
@@ -597,7 +598,15 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                         bool currHasTc = clone.ToolCalls != null && clone.ToolCalls.Count > 0;
                         mergedPositions.Add($"[{msgIndex}]{clone.Role}(lastTc={lastHasTc},curTc={currHasTc},exist={existingContent.Length},new={newContent.Length})");
 
-                        if (!string.IsNullOrWhiteSpace(newContent))
+                        if (clone.Role == "user"
+                            && (clone.MultimodalContent is { Count: > 0 }
+                                || lastMsg.MultimodalContent is { Count: > 0 }))
+                        {
+                            // 视觉消息不能简单按字符串拼接，否则会把图片块丢成纯文本。
+                            lastMsg.MultimodalContent = MergeUserContentParts(lastMsg, clone);
+                            lastMsg.Content = null;
+                        }
+                        else if (!string.IsNullOrWhiteSpace(newContent))
                         {
                             // ── 合并内容：用分隔线连接 ──
                             lastMsg.Content = string.IsNullOrWhiteSpace(existingContent)
@@ -745,6 +754,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 {
                     Role = m.Role,
                     Content = m.Content,
+                    MultimodalContent = m.MultimodalContent,
                     ReasoningContent = m.ReasoningContent,
                     ToolCalls = m.ToolCalls?
                         .Select(tc => new ToolCall
@@ -1123,6 +1133,58 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             // ── 流正常结束（无 [DONE] 时）输出缓存诊断 ──
             FlushCacheDiagnostics();
             } // using(response) — 重试块闭合
+        }
+
+        /// <summary>
+        /// 合并连续的用户消息，同时保留视觉内容块。视觉模型的 content 是数组，
+        /// 不能像纯文本一样直接字符串拼接，否则 image_url 块会丢失。
+        /// </summary>
+        private static List<ChatContentPart> MergeUserContentParts(
+            ChatApiMessage first,
+            ChatApiMessage second)
+        {
+            var result = new List<ChatContentPart>();
+
+            if (first.MultimodalContent is { Count: > 0 } firstParts)
+                result.AddRange(CloneContentParts(firstParts));
+            else if (!string.IsNullOrWhiteSpace(first.Content))
+                result.Add(TextContentPart(first.Content));
+
+            if (second.MultimodalContent is { Count: > 0 } secondParts)
+                result.AddRange(CloneContentParts(secondParts));
+            else if (!string.IsNullOrWhiteSpace(second.Content))
+                result.Add(TextContentPart(second.Content));
+
+            return result;
+        }
+
+        private static List<ChatContentPart> CloneContentParts(List<ChatContentPart> parts)
+        {
+            return parts.Select(p => new ChatContentPart
+            {
+                Type = p.Type,
+                Text = p.Text,
+                ImageUrl = p.ImageUrl == null
+                    ? null
+                    : new ChatImageUrl { Url = p.ImageUrl.Url, Detail = p.ImageUrl.Detail },
+                File = p.File == null
+                    ? null
+                    : new ChatFilePart
+                    {
+                        FileId = p.File.FileId,
+                        FileData = p.File.FileData,
+                        Filename = p.File.Filename,
+                    },
+            }).ToList();
+        }
+
+        private static ChatContentPart TextContentPart(string text)
+        {
+            return new ChatContentPart
+            {
+                Type = "text",
+                Text = text,
+            };
         }
 
         /// <summary>

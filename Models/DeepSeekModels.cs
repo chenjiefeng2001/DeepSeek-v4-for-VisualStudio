@@ -9,6 +9,26 @@ using System.Text.Json.Serialization;
 
 namespace DeepSeek_v4_for_VisualStudio.Models
 {
+    /// <summary>
+    /// DeepSeek V4 系列模型标识，避免模型名散落在 UI 和 API 层。
+    /// </summary>
+    public static class DeepSeekModelCatalog
+    {
+        public const string Pro = "deepseek-v4-pro";
+        public const string Flash = "deepseek-v4-flash";
+        public const string FlashVisionExp = "deepseek-v4-flash-vision-exp";
+
+        public static readonly string[] All =
+        {
+            Pro,
+            Flash,
+            FlashVisionExp,
+        };
+
+        public static bool IsVisionModel(string? model)
+            => string.Equals(model, FlashVisionExp, StringComparison.OrdinalIgnoreCase);
+    }
+
     // ======== API 请求模型 ========
     public class DeepSeekChatRequest
     {
@@ -77,15 +97,89 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         public string Type { get; set; } = "enabled"; // "enabled" 或 "disabled"
     }
 
+    /// <summary>
+    /// 视觉模型 content 数组中的一个内容块。
+    /// 只序列化 API 需要的字段，避免额外属性污染请求体。
+    /// </summary>
+    public class ChatContentPart
+    {
+        [JsonPropertyName("type")]
+        public string Type { get; set; } = string.Empty;
+
+        [JsonPropertyName("text")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Text { get; set; }
+
+        [JsonPropertyName("image_url")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public ChatImageUrl? ImageUrl { get; set; }
+
+        [JsonPropertyName("file")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public ChatFilePart? File { get; set; }
+    }
+
+    /// <summary>
+    /// OpenAI 兼容的 image_url 内容。
+    /// </summary>
+    public class ChatImageUrl
+    {
+        [JsonPropertyName("url")]
+        public string? Url { get; set; }
+
+        [JsonPropertyName("detail")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Detail { get; set; }
+    }
+
+    /// <summary>
+    /// Files API 文件引用内容块。file_id / file_data 二选一。
+    /// </summary>
+    public class ChatFilePart
+    {
+        [JsonPropertyName("file_id")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? FileId { get; set; }
+
+        [JsonPropertyName("file_data")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? FileData { get; set; }
+
+        [JsonPropertyName("filename")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Filename { get; set; }
+    }
+
     // 对话消息（API 格式）
     public class ChatApiMessage
     {
         [JsonPropertyName("role")]
         public string Role { get; set; } = "user";
 
+        /// <summary>
+        /// 纯文本消息内容。视觉模型使用 <see cref="MultimodalContent"/> 时，
+        /// 此字段仍保留文本副本，方便现有 UI / 日志代码读取。
+        /// </summary>
+        [JsonIgnore]
+        public string? Content { get; set; }
+
+        /// <summary>
+        /// 视觉模型使用的 content 块数组。非空时优先级高于 <see cref="Content"/>。
+        /// </summary>
+        [JsonIgnore]
+        public List<ChatContentPart>? MultimodalContent { get; set; }
+
         [JsonPropertyName("content")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-        public string? Content { get; set; }
+        public object? ContentPayload
+        {
+            get
+            {
+                if (MultimodalContent is { Count: > 0 } parts)
+                    return parts;
+                return Content;
+            }
+        }
 
         [JsonPropertyName("reasoning_content")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

@@ -162,12 +162,39 @@ namespace DeepSeek_v4_for_VisualStudio.View
             string fileContext = string.Empty;
             List<string> attachedFileNames = new();
             List<FileParseResult> parseResults = new();
+            List<ChatContentPart>? visionContent = null;
+            bool visionModelSelected = DeepSeekModelCatalog.IsVisionModel(_options?.SelectedModel);
+            bool ocrExplicitlyRequested = IsOcrExplicitlyRequested(userText, effectiveUserText);
 
             if (_attachedFilePaths.Count > 0)
             {
                 StatusLabel.Text = LocalizationService.Instance["status.parsingFile"];
-                parseResults = await FileParserService.ParseFilesAsync(_attachedFilePaths);
-                attachedFileNames = parseResults.Where(r => r.Success).Select(r => r.FileName).ToList();
+                attachedFileNames = _attachedFilePaths
+                    .Select(path => Path.GetFileName(path))
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Cast<string>()
+                    .ToList();
+
+                if (visionModelSelected && !ocrExplicitlyRequested)
+                {
+                    var directImagePaths = _attachedFilePaths
+                        .Where(IsVisionImageFile)
+                        .ToList();
+                    var parsedPaths = _attachedFilePaths
+                        .Where(path => !directImagePaths.Contains(path, StringComparer.OrdinalIgnoreCase))
+                        .ToList();
+
+                    visionContent = await Task.Run(() => BuildVisionContent(directImagePaths));
+                    parseResults = parsedPaths.Count > 0
+                        ? await FileParserService.ParseFilesAsync(parsedPaths)
+                        : new List<FileParseResult>();
+                    Logger.Info($"[Vision] 直接发送图片 {directImagePaths.Count} 张，解析其他文件 {parsedPaths.Count} 个");
+                }
+                else
+                {
+                    parseResults = await FileParserService.ParseFilesAsync(_attachedFilePaths);
+                }
+
                 fileContext = FileParserService.FormatParseResultsForContext(parseResults);
                 if (!string.IsNullOrEmpty(fileContext))
                     Logger.Info($"文件解析完成: {attachedFileNames.Count} 个文件");
@@ -300,8 +327,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
                         var capturedUserText = !string.IsNullOrEmpty(agentRoutedUserText)
                             ? agentRoutedUserText
-                            : analyzeFilesPrompt;
+                            : (visionContent is { Count: > 0 } && !string.IsNullOrEmpty(effectiveUserText)
+                                ? effectiveUserText
+                                : analyzeFilesPrompt);
                         var capturedFileContext = fileContext;
+                        var capturedVisionContent = visionContent;
                         var capturedRoute = routing;
                         var capturedMsgIdx = capturedUserMsgIndex;
 
@@ -312,7 +342,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
                         {
                             try
                             {
-                                await RunAgentWorkflowAsync(capturedUserText, capturedFileContext, capturedRoute);
+                                await RunAgentWorkflowAsync(
+                                    capturedUserText,
+                                    capturedFileContext,
+                                    capturedRoute,
+                                    capturedVisionContent);
                                 RecordAgentFileChanges(capturedMsgIdx);
                             }
                             catch (Exception ex)
@@ -398,6 +432,93 @@ namespace DeepSeek_v4_for_VisualStudio.View
             string result = sb.ToString().Trim();
             return result.Length > 0 ? result : null;
         }
+
+        #region Vision Model Helpers
+
+        private static readonly string[] VisionImageExtensions =
+        {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp",
+        };
+
+        private static bool IsVisionImageFile(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                return false;
+
+            string ext = Path.GetExtension(filePath);
+            return VisionImageExtensions.Any(
+                supported => string.Equals(ext, supported, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsOcrExplicitlyRequested(string? userText, string? effectiveUserText)
+        {
+            string text = ((effectiveUserText ?? string.Empty) + "\n" + (userText ?? string.Empty))
+                .ToLowerInvariant();
+
+            return text.Contains("ocr")
+                || text.Contains("文字识别")
+                || text.Contains("识别文字")
+                || text.Contains("提取文字")
+                || text.Contains("提取图片文字")
+                || text.Contains("读取图片文字")
+                || text.Contains("图片文字");
+        }
+
+        private static List<ChatContentPart>? BuildVisionContent(List<string> imagePaths)
+        {
+            var parts = new List<ChatContentPart>();
+            const long maxImageBytes = 32L * 1024 * 1024;
+
+            foreach (string path in imagePaths)
+            {
+                try
+                {
+                    if (!File.Exists(path))
+                    {
+                        Logger.Warn($"[Vision] 图片不存在，跳过: {path}");
+                        continue;
+                    }
+
+                    var fileInfo = new FileInfo(path);
+                    if (fileInfo.Length > maxImageBytes)
+                    {
+                        Logger.Warn($"[Vision] 图片超过 32MiB 限制，跳过: {Path.GetFileName(path)}");
+                        continue;
+                    }
+
+                    string? mediaType = path.ToLowerInvariant() switch
+                    {
+                        var p when p.EndsWith(".png") => "image/png",
+                        var p when p.EndsWith(".jpg") || p.EndsWith(".jpeg") => "image/jpeg",
+                        var p when p.EndsWith(".gif") => "image/gif",
+                        var p when p.EndsWith(".webp") => "image/webp",
+                        _ => null,
+                    };
+
+                    if (mediaType == null)
+                        continue;
+
+                    byte[] bytes = File.ReadAllBytes(path);
+                    string base64 = Convert.ToBase64String(bytes);
+                    parts.Add(new ChatContentPart
+                    {
+                        Type = "image_url",
+                        ImageUrl = new ChatImageUrl
+                        {
+                            Url = $"data:{mediaType};base64,{base64}",
+                        },
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"[Vision] 构建图片内容失败 {Path.GetFileName(path)}: {ex.Message}");
+                }
+            }
+
+            return parts.Count > 0 ? parts : null;
+        }
+
+        #endregion
 
         private void StopGeneration()
         {

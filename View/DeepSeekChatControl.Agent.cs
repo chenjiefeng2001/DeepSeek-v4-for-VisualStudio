@@ -296,8 +296,11 @@ namespace DeepSeek_v4_for_VisualStudio.View
         /// Agent 工作流主入口：分解任务 → 显示步骤计划 → 逐步执行 → 显示变更摘要。
         /// 注意：此方法在后台线程中调用，访问 UI 前必须切换到主线程。
         /// </summary>
-        private async Task RunAgentWorkflowAsync(string userText, string fileContext = "",
-            AgentRoutingResult? routing = null)
+        private async Task RunAgentWorkflowAsync(
+            string userText,
+            string fileContext = "",
+            AgentRoutingResult? routing = null,
+            List<ChatContentPart>? visionContent = null)
         {
             if (_activeAgent == null || _agentFactory == null) return;
 
@@ -333,6 +336,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 {
                     SolutionPath = _solutionPath,
                     FileContext = fileContext,
+                    VisionContent = visionContent,
                     ConversationHistory = _contextManager.GetConversationHistory(),
                     ContextManager = _contextManager,
                     IsPlanningMode = routing?.NeedsPlanning == true || routing?.TargetAgent == AgentType.Plan,

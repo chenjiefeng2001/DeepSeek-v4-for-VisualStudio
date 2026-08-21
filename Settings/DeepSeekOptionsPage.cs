@@ -431,7 +431,7 @@ namespace DeepSeek_v4_for_VisualStudio.Settings
     {
         public override bool GetStandardValuesSupported(ITypeDescriptorContext? context) => true;
         public override StandardValuesCollection GetStandardValues(ITypeDescriptorContext? context)
-            => new(new[] { "deepseek-v4-pro", "deepseek-v4-flash" });
+            => new(DeepSeekModelCatalog.All);
     }
 
     /// <summary>
