@@ -1,0 +1,111 @@
+name: Create Release (手动发版)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不含 v 前缀，例如 1.1.14）'
+        required: true
+        type: string
+      variant:
+        description: '发布版本类型'
+        required: true
+        type: choice
+        default: 'standard'
+        options:
+          - standard
+          - no-local-ocr
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+    - name: 检出目标分支
+      uses: actions/checkout@v4
+      with:
+        # 根据发布类型选择分支：标准版用 master，无 OCR 版用 no-local-paddleocr
+        ref: ${{ github.event.inputs.variant == 'no-local-ocr' && 'no-local-paddleocr' || 'master' }}
+        fetch-depth: 0
+
+    - name: 计算 tag 名称
+      id: tag
+      shell: pwsh
+      run: |
+        $version = "${{ github.event.inputs.version }}".Trim()
+        # 校验版本号格式：x.y 或 x.y.z
+        if ($version -notmatch '^\d+\.\d+(\.\d+)?$') {
+          throw "版本号格式无效，应为 x.y 或 x.y.z（如 1.1.14），实际为: $version"
+        }
+        $variant = "${{ github.event.inputs.variant }}"
+        $tag = if ($variant -eq 'no-local-ocr') { "v${version}-No-Local-OCR" } else { "v${version}" }
+        Write-Host "将创建 tag: $tag"
+        "tag=$tag" >> $env:GITHUB_OUTPUT
+
+    - name: 检查 tag 是否已存在
+      shell: pwsh
+      run: |
+        $tag = "${{ steps.tag.outputs.tag }}"
+        git rev-parse "$tag" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          throw "tag $tag 已存在，请使用新的版本号"
+        }
+        Write-Host "tag $tag 不存在，可以创建"
+
+    - name: 创建并推送 tag
+      shell: pwsh
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        $tag = "${{ steps.tag.outputs.tag }}"
+        git tag "$tag"
+        git push origin "$tag"
+        Write-Host "已推送 tag: $tag"
+
+    - name: 安装 MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: 安装 .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: 还原 NuGet 包
+      run: dotnet restore
+
+    - name: 同步 VSIX 版本号
+      shell: pwsh
+      run: |
+        $tag = "${{ steps.tag.outputs.tag }}"
+        # 去掉 v 前缀和 -No-Local-OCR 后缀，得到纯数字版本号（VSIX 版本号必须是 x.y.z 格式）
+        $version = $tag -replace '^v', '' -replace '-No-Local-OCR$', ''
+        $manifest = 'source.extension.vsixmanifest'
+        $content = Get-Content $manifest -Raw
+        $content = $content -replace 'Version="[^"]*"', "Version=`"$version`""
+        Set-Content $manifest $content -NoNewline
+        Write-Host "VSIX 版本号已同步为: $version"
+
+    - name: 构建 VSIX
+      run: msbuild DeepSeek_v4_for_VisualStudio.csproj /t:Build /p:Configuration=Release /p:DeployExtension=false
+
+    - name: 重命名 VSIX（含版本号）
+      shell: pwsh
+      run: |
+        $tag = "${{ steps.tag.outputs.tag }}"
+        $version = $tag -replace '^v', ''
+        $vsix = Get-ChildItem bin\Release\net472\*.vsix | Select-Object -First 1
+        $newName = "DeepSeek_v4_for_VisualStudio-v$version.vsix"
+        Rename-Item $vsix.FullName $newName
+        Write-Host "已重命名为: $newName"
+
+    - name: 发布 Release 并上传 VSIX
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        files: bin/Release/net472/*.vsix
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
