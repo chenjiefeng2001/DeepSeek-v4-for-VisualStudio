@@ -1,5 +1,6 @@
 using DeepSeek_v4_for_VisualStudio.Models;
 using DeepSeek_v4_for_VisualStudio.Services;
+using System.Text.Json;
 
 namespace DeepSeek_v4_for_VisualStudio.Tests.Unit.Services;
 
@@ -61,6 +62,29 @@ public class ConversationContextManagerExtendedTests
 
         // 空白内容仍然被添加
         _manager.IsEmpty.Should().BeFalse();
+    }
+
+    [Fact]
+    public void AddUserMessage_EmptyTextAndVisualContent_StillCountsAsUserTurn()
+    {
+        var visual = new List<ChatContentPart>
+        {
+            new()
+            {
+                Type = "image_url",
+                ImageUrl = new ChatImageUrl { Url = "data:image/png;base64,AAAA" },
+            },
+        };
+
+        _manager.AddUserMessage(string.Empty, visual);
+
+        _manager.IsEmpty.Should().BeFalse();
+        _manager.TurnCount.Should().Be(1);
+
+        var userMessage = _manager.BuildApiMessages().FirstOrDefault(m => m.Role == "user");
+        userMessage.Should().NotBeNull();
+        userMessage!.MultimodalContent.Should().NotBeNull();
+        userMessage.MultimodalContent.Should().HaveCount(1);
     }
 
     #endregion
@@ -549,6 +573,36 @@ public class ConversationContextManagerExtendedTests
         _manager.RestoreFullContext(savedContext);
 
         _manager.MessageCount.Should().Be(2);
+        _manager.TurnCount.Should().Be(1);
+    }
+
+    [Fact]
+    public void GetFullContext_JsonRoundTrip_PreservesVisualContent()
+    {
+        _manager.AddUserMessage(
+            string.Empty,
+            new List<ChatContentPart>
+            {
+                new()
+                {
+                    Type = "image_url",
+                    ImageUrl = new ChatImageUrl { Url = "data:image/png;base64,AAAA" },
+                },
+            });
+
+        var savedContext = _manager.GetFullContext();
+        var json = JsonSerializer.Serialize(savedContext);
+        var deserialized = JsonSerializer.Deserialize<List<ChatApiMessage>>(json);
+
+        deserialized.Should().NotBeNull();
+        deserialized.Should().NotBeEmpty();
+        deserialized![0].MultimodalContent.Should().NotBeNull();
+        deserialized[0].MultimodalContent.Should().HaveCount(1);
+
+        _manager.Clear();
+        _manager.RestoreFullContext(deserialized);
+
+        _manager.IsEmpty.Should().BeFalse();
         _manager.TurnCount.Should().Be(1);
     }
 

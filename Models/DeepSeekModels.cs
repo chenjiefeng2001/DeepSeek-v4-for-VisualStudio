@@ -179,6 +179,43 @@ namespace DeepSeek_v4_for_VisualStudio.Models
                     return parts;
                 return Content;
             }
+            set
+            {
+                Content = null;
+                MultimodalContent = null;
+
+                if (value is null)
+                    return;
+
+                if (value is JsonElement element)
+                {
+                    if (element.ValueKind == JsonValueKind.String)
+                    {
+                        Content = element.GetString();
+                    }
+                    else if (element.ValueKind == JsonValueKind.Array)
+                    {
+                        MultimodalContent = JsonSerializer.Deserialize<List<ChatContentPart>>(element.GetRawText());
+                    }
+                    else if (element.ValueKind == JsonValueKind.Object)
+                    {
+                        // Persisted content is normally either a string or an array of parts.
+                        Content = element.ToString();
+                    }
+                    return;
+                }
+
+                if (value is string text)
+                {
+                    Content = text;
+                    return;
+                }
+
+                if (value is IEnumerable<ChatContentPart> enumerableParts)
+                {
+                    MultimodalContent = enumerableParts.ToList();
+                }
+            }
         }
 
         [JsonPropertyName("reasoning_content")]

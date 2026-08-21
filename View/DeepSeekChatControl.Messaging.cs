@@ -252,7 +252,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 var tree = EnsureTree();
                 tree.AddChildMessage(earlyUserMsg);
                 SyncMessagesFromTree();
-                _contextManager.AddUserMessage(fullUserContent);
+                _contextManager.AddUserMessage(fullUserContent, visionContent);
                 earlyUserMsgIndex = _messages.Count - 1;
             }
             AddMessagesHtml(
@@ -543,6 +543,42 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 catch (Exception ex)
                 {
                     Logger.Warn($"[Vision] 构建图片内容失败 {Path.GetFileName(path)}: {ex.Message}");
+                }
+            }
+
+            return parts.Count > 0 ? parts : null;
+        }
+
+        /// <summary>
+        /// 从树节点恢复视觉消息的 content 数组。优先使用原始图片路径重建完整图，
+        /// 没有路径时使用保存的缩略图 Data URI 作为回退。
+        /// </summary>
+        private static List<ChatContentPart>? BuildStoredVisionContent(ChatMessage message)
+        {
+            var parts = new List<ChatContentPart>();
+
+            if (message.AttachedImagePaths is { Count: > 0 })
+            {
+                var fullSizeParts = BuildVisionContent(message.AttachedImagePaths);
+                if (fullSizeParts != null)
+                    parts.AddRange(fullSizeParts);
+            }
+
+            // 只处理没有完整路径的存量消息，避免同一张图既作为缩略图又作为原图重复注入。
+            if (message.AttachedImagePaths is not { Count: > 0 }
+                && message.AttachedImageDataUris is { Count: > 0 })
+            {
+                foreach (string dataUri in message.AttachedImageDataUris)
+                {
+                    if (string.IsNullOrWhiteSpace(dataUri)
+                        || !dataUri.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    parts.Add(new ChatContentPart
+                    {
+                        Type = "image_url",
+                        ImageUrl = new ChatImageUrl { Url = dataUri },
+                    });
                 }
             }
 

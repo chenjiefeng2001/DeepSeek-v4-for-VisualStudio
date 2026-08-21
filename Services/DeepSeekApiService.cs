@@ -1144,18 +1144,66 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             ChatApiMessage second)
         {
             var result = new List<ChatContentPart>();
+            var seenImageUrls = new HashSet<string>(StringComparer.Ordinal);
+            var seenText = new HashSet<string>(StringComparer.Ordinal);
 
             if (first.MultimodalContent is { Count: > 0 } firstParts)
-                result.AddRange(CloneContentParts(firstParts));
+                AddContentPartsDeduplicated(result, firstParts, seenImageUrls, seenText);
             else if (!string.IsNullOrWhiteSpace(first.Content))
-                result.Add(TextContentPart(first.Content));
+                AddTextDeduplicated(result, first.Content, seenText);
 
             if (second.MultimodalContent is { Count: > 0 } secondParts)
-                result.AddRange(CloneContentParts(secondParts));
+                AddContentPartsDeduplicated(result, secondParts, seenImageUrls, seenText);
             else if (!string.IsNullOrWhiteSpace(second.Content))
-                result.Add(TextContentPart(second.Content));
+                AddTextDeduplicated(result, second.Content, seenText);
 
             return result;
+        }
+
+        private static void AddContentPartsDeduplicated(
+            List<ChatContentPart> target,
+            IEnumerable<ChatContentPart> parts,
+            HashSet<string> seenImageUrls,
+            HashSet<string> seenText)
+        {
+            foreach (var part in parts)
+            {
+                if (part.Type == "image_url" && part.ImageUrl?.Url != null)
+                {
+                    if (seenImageUrls.Add(part.ImageUrl.Url))
+                    {
+                        target.Add(new ChatContentPart
+                        {
+                            Type = part.Type,
+                            ImageUrl = new ChatImageUrl
+                            {
+                                Url = part.ImageUrl.Url,
+                                Detail = part.ImageUrl.Detail,
+                            },
+                        });
+                    }
+                    continue;
+                }
+
+                if (part.Type == "text")
+                {
+                    AddTextDeduplicated(target, part.Text ?? string.Empty, seenText);
+                    continue;
+                }
+
+                target.Add(CloneContentParts(new List<ChatContentPart> { part })[0]);
+            }
+        }
+
+        private static void AddTextDeduplicated(
+            List<ChatContentPart> target,
+            string text,
+            HashSet<string> seenText)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return;
+            if (seenText.Add(text))
+                target.Add(TextContentPart(text));
         }
 
         private static List<ChatContentPart> CloneContentParts(List<ChatContentPart> parts)
