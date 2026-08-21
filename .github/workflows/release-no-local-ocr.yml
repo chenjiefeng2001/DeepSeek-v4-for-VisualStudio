@@ -1,0 +1,62 @@
+name: Release (No Local OCR)
+
+on:
+  push:
+    tags:
+      - '*-No-Local-OCR'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Restore NuGet packages
+      run: dotnet restore
+
+    - name: Sync VSIX version with tag
+      shell: pwsh
+      run: |
+        $tag = "${{ github.ref_name }}"
+        # 去掉 v 前缀和 -No-Local-OCR 后缀，得到纯版本号（VSIX 版本号必须是 x.y.z 格式）
+        $version = $tag -replace '^v', '' -replace '-No-Local-OCR$', ''
+        $manifest = 'source.extension.vsixmanifest'
+        $content = Get-Content $manifest -Raw
+        $content = $content -replace 'Version="[^"]*"', "Version=`"$version`""
+        Set-Content $manifest $content -NoNewline
+        Write-Host "VSIX version set to $version (tag: $tag)"
+
+    - name: Build VSIX
+      run: msbuild DeepSeek_v4_for_VisualStudio.csproj /t:Build /p:Configuration=Release /p:DeployExtension=false
+
+    - name: Rename VSIX with version
+      shell: pwsh
+      run: |
+        $tag = "${{ github.ref_name }}"
+        # 保留 -No-Local-OCR 后缀用于文件名
+        $version = $tag -replace '^v', ''
+        $vsix = Get-ChildItem bin\Release\net472\*.vsix | Select-Object -First 1
+        $newName = "DeepSeek_v4_for_VisualStudio-v$version.vsix"
+        Rename-Item $vsix.FullName $newName
+        Write-Host "Renamed to $newName"
+
+    - name: Upload VSIX to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: bin/Release/net472/*.vsix
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

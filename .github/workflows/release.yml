@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '!*-No-Local-OCR'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Restore NuGet packages
+      run: dotnet restore
+
+    - name: Sync VSIX version with tag
+      shell: pwsh
+      run: |
+        $version = "${{ github.ref_name }}" -replace '^v', ''
+        $manifest = 'source.extension.vsixmanifest'
+        $content = Get-Content $manifest -Raw
+        $content = $content -replace 'Version="[^"]*"', "Version=`"$version`""
+        Set-Content $manifest $content -NoNewline
+        Write-Host "VSIX version set to $version"
+
+    - name: Build VSIX
+      run: msbuild DeepSeek_v4_for_VisualStudio.csproj /t:Build /p:Configuration=Release /p:DeployExtension=false
+
+    - name: Rename VSIX with version
+      shell: pwsh
+      run: |
+        $version = "${{ github.ref_name }}" -replace '^v', ''
+        $vsix = Get-ChildItem bin\Release\net472\*.vsix | Select-Object -First 1
+        $newName = "DeepSeek_v4_for_VisualStudio-v$version.vsix"
+        Rename-Item $vsix.FullName $newName
+        Write-Host "Renamed to $newName"
+
+    - name: Upload VSIX to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: bin/Release/net472/*.vsix
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
