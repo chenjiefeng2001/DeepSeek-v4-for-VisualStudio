@@ -21,6 +21,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media.Imaging;
 
 namespace DeepSeek_v4_for_VisualStudio.View
 {
@@ -1497,6 +1498,13 @@ namespace DeepSeek_v4_for_VisualStudio.View
         {
             lock (_streamBatchLock)
                 _streamBatchStates.Remove(messageIndex);
+        }
+
+        internal sealed class AttachedFileItem
+        {
+            public string FilePath { get; set; } = string.Empty;
+            public string FileName { get; set; } = string.Empty;
+            public BitmapImage? ThumbnailSource { get; set; }
         }
     }
 }

@@ -491,6 +491,26 @@ namespace DeepSeek_v4_for_VisualStudio.Models
         [DataMember]
         public List<FileParseResult> AttachedFiles { get; set; } = new();
 
+        /// <summary>
+        /// 图片附件的缩略图 Data URI，用于在聊天气泡中直接显示图片预览。
+        /// 与 <see cref="AttachedFileNames"/> 等旧字段分离，避免污染 OCR/文本文件上下文。
+        /// </summary>
+        [DataMember]
+        public List<string> AttachedImageDataUris { get; set; } = new();
+
+        /// <summary>
+        /// 图片附件文件名，与 <see cref="AttachedImageDataUris"/> 一一对应。
+        /// </summary>
+        [DataMember]
+        public List<string> AttachedImageFileNames { get; set; } = new();
+
+        /// <summary>
+        /// 图片附件在本机的完整路径，与图片预览一一对应，
+        /// 供点击聊天气泡缩略图时打开原始文件。
+        /// </summary>
+        [DataMember]
+        public List<string> AttachedImagePaths { get; set; } = new();
+
         // ======== 树状结构字段 ========
 
         /// <summary>

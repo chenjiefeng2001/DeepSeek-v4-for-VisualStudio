@@ -14,6 +14,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media.Imaging;
 
 namespace DeepSeek_v4_for_VisualStudio.View
 {
@@ -200,10 +201,29 @@ namespace DeepSeek_v4_for_VisualStudio.View
                     Logger.Info($"文件解析完成: {attachedFileNames.Count} 个文件");
             }
 
+            List<string> attachedImageDataUris = new();
+            List<string> attachedImageFileNames = new();
+            List<string> attachedImagePaths = new();
+            foreach (string imagePath in _attachedFilePaths.Where(OcrService.IsImageFile))
+            {
+                string? dataUri = CreateImageThumbnailDataUri(imagePath);
+                if (string.IsNullOrWhiteSpace(dataUri))
+                {
+                    Logger.Warn($"[Preview] 图片缩略图生成失败，跳过: {Path.GetFileName(imagePath)}");
+                    continue;
+                }
+
+                attachedImageDataUris.Add(dataUri);
+                attachedImageFileNames.Add(Path.GetFileName(imagePath));
+                attachedImagePaths.Add(imagePath);
+            }
+
             // 构建用户消息内容
             string analyzeFilesPrompt = "请分析以上文件内容。";
             string userDisplayContent = userText ?? string.Empty;
-            if (string.IsNullOrEmpty(userDisplayContent) && attachedFileNames.Count > 0)
+            if (string.IsNullOrEmpty(userDisplayContent)
+                && attachedFileNames.Count > 0
+                && attachedImageDataUris.Count == 0)
                 userDisplayContent = $"[已上传 {attachedFileNames.Count} 个文件]";
 
             string fullUserContent;
@@ -221,6 +241,9 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 Content = userDisplayContent,
                 AttachedFileNames = attachedFileNames,
                 AttachedFiles = parseResults,
+                AttachedImageDataUris = attachedImageDataUris,
+                AttachedImageFileNames = attachedImageFileNames,
+                AttachedImagePaths = attachedImagePaths,
                 Timestamp = DateTime.Now,
             };
             int earlyUserMsgIndex;
@@ -232,7 +255,15 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 _contextManager.AddUserMessage(fullUserContent);
                 earlyUserMsgIndex = _messages.Count - 1;
             }
-            AddMessagesHtml("user", userDisplayContent, null, parseResults, earlyUserMsgIndex);
+            AddMessagesHtml(
+                "user",
+                userDisplayContent,
+                null,
+                parseResults,
+                attachedImageDataUris,
+                attachedImageFileNames,
+                attachedImagePaths,
+                earlyUserMsgIndex);
             UpdateBrowser();
             ClearAttachedFiles();
             AutoTitleSession();
@@ -516,6 +547,31 @@ namespace DeepSeek_v4_for_VisualStudio.View
             }
 
             return parts.Count > 0 ? parts : null;
+        }
+
+        private static string? CreateImageThumbnailDataUri(string imagePath)
+        {
+            try
+            {
+                var bitmap = new BitmapImage();
+                bitmap.BeginInit();
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+                bitmap.DecodePixelWidth = 96;
+                bitmap.UriSource = new Uri(imagePath, UriKind.Absolute);
+                bitmap.EndInit();
+
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                using var stream = new MemoryStream();
+                encoder.Save(stream);
+                return "data:image/png;base64," + Convert.ToBase64String(stream.ToArray());
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[Preview] 图片预览 DATA URI 生成失败 {Path.GetFileName(imagePath)}: {ex.Message}");
+                return null;
+            }
         }
 
         #endregion
