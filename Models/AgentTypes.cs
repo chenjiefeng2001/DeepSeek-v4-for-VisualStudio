@@ -94,6 +94,13 @@ namespace DeepSeek_v4_for_VisualStudio.Models
 
         /// <summary>推荐模型（可选）</summary>
         public string? Model { get; set; }
+
+        /// <summary>
+        /// 源 Agent 在当前 Handoff 前实际缓存的消息前缀。
+        /// 仅在同一进程内的 Handoff 链/按钮执行时使用，不随 HandoffJson 持久化。
+        /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public List<ChatApiMessage>? ForwardedMessages { get; set; }
     }
 
     /// <summary>

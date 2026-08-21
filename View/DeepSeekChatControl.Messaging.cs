@@ -262,8 +262,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
                 bool hasAgentInput = !string.IsNullOrEmpty(effectiveUserText) || hasAttachments;
                 if (_activeAgent != null && _agentFactory != null && hasAgentInput && !effectiveUserText.StartsWith("/"))
                 {
-                    // ── 确保系统提示词已初始化（新会话时 _fixedSystemPrompt 为 null，
-                    //     BuildRequestMessagesAsync 在上方未被调用，需在此处补做初始化）──
+                    // ── 确保系统提示词已初始化（新会话时 _fixedSystemPrompt 为 null）──
                     await EnsureSystemPromptInitializedAsync();
 
                     // ── 预分类任务规模，Large 任务提前路由到 Plan Agent ──
@@ -398,47 +397,6 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
             string result = sb.ToString().Trim();
             return result.Length > 0 ? result : null;
-        }
-
-        /// <summary>
-        /// 构建发送给 API 的消息列表。
-        /// 委托 InitializeSystemContextAsync 完成 prompt/skill/memory 初始化，
-        /// 此处只处理每轮可变的 RAG + 搜索上下文 + 统计。
-        /// </summary>
-        private async Task<List<ChatApiMessage>> BuildRequestMessagesAsync(string searchContext = "")
-        {
-            await InitializeSystemContextAsync();
-
-            if (_ragService != null && _ragService.IsEnabled && _options?.EnableRag == true)
-            {
-                try
-                {
-                    var userMessages = _contextManager.GetConversationHistory().Where(m => m.Role == "user").ToList();
-                    string query = userMessages.Count > 0 ? (userMessages.Last().Content ?? string.Empty) : string.Empty;
-                    if (!string.IsNullOrWhiteSpace(query))
-                    {
-                        int topK = _options?.RagTopK ?? 5;
-                        string ragContext = await _ragService.RetrieveContextAsync(query, topK);
-                        _contextManager.SetRagContext(string.IsNullOrWhiteSpace(ragContext) ? null : ragContext);
-                        if (!string.IsNullOrWhiteSpace(ragContext))
-                            Logger.Info($"[RAG] 检索上下文已注入 (topK={topK}, 长度={ragContext.Length})");
-                    }
-                }
-                catch (Exception ex) { Logger.Warn($"[RAG] 检索失败: {ex.Message}"); _contextManager.SetRagContext(null); }
-            }
-
-            _contextManager.SetSearchContext(string.IsNullOrWhiteSpace(searchContext) ? null : searchContext);
-
-            if (_options?.ShowContextStats == true || _contextManager.UsageRatio > 0.7)
-            {
-                var stats = _contextManager.GetStats();
-                string level = stats.UsageRatio > 0.9 ? "⚠️" : stats.UsageRatio > 0.7 ? "ℹ️" : "";
-                Logger.Info($"[ContextStats] {level} Token: {stats.EstimatedTokens:N0}/{stats.TokenBudget:N0} ({stats.UsagePercent:F1}%) | 轮次: {stats.TurnCount} | 消息: {stats.MessageCount}");
-                if (stats.UsageRatio > 0.9)
-                    StatusLabel.Text = string.Format(LocalizationService.Instance["status.compressionTriggered"], stats.UsagePercent);
-            }
-
-            return _contextManager.BuildApiMessages();
         }
 
         private void StopGeneration()

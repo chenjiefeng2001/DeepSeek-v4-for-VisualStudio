@@ -49,6 +49,12 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         /// </summary>
         public DeepSeekUsage? LastUsage { get; private set; }
 
+        /// <summary>
+        /// 最近一次 Chat API 实际发送的消息列表（清洗/规则处理后的最终版本）。
+        /// Handoff 时优先转发此快照，确保目标 Agent 使用与服务器缓存完全一致的 messages 长度和字段。
+        /// </summary>
+        public IReadOnlyList<ChatApiMessage>? LastSentMessages { get; private set; }
+
         // ── 线程安全的累计统计字段（使用 Interlocked 保证多 Agent 并行调用时正确累加）──
         private long _totalCacheHitTokens;
         private long _totalCacheMissTokens;
@@ -732,6 +738,29 @@ namespace DeepSeek_v4_for_VisualStudio.Services
             {
                 Logger.Warn($"[API] 移除 {orphanToolCount} 条孤立 tool 消息（tool_call_id 无匹配 assistant），避免 HTTP 400；剩余 {request.Messages.Count} 条");
             }
+
+            // ── 保存本次实际发送的消息快照，供 Handoff 复用 ──
+            LastSentMessages = request.Messages
+                .Select(m => new ChatApiMessage
+                {
+                    Role = m.Role,
+                    Content = m.Content,
+                    ReasoningContent = m.ReasoningContent,
+                    ToolCalls = m.ToolCalls?
+                        .Select(tc => new ToolCall
+                        {
+                            Id = tc.Id,
+                            Type = tc.Type,
+                            Function = new ToolCallFunction
+                            {
+                                Name = tc.Function?.Name,
+                                Arguments = tc.Function?.Arguments,
+                            }
+                        }).ToList(),
+                    ToolCallId = m.ToolCallId,
+                    Name = m.Name,
+                })
+                .ToList();
 
             // ── 预序列化请求体，供重试时复用 ──
             var requestJson = JsonSerializer.Serialize(request, new JsonSerializerOptions

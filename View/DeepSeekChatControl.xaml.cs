@@ -556,8 +556,7 @@ namespace DeepSeek_v4_for_VisualStudio.View
 
             // ── 链式初始化：先解析项目路径 → 再加载会话 ──
             // 之前两者各自 fire-and-forget，导致首条消息发送时 _solutionPath 可能仍为 null。
-            // 现在确保 ResolveSolutionPathAsync 完成后再执行 LoadAndShowAsync，
-            // 同时 BuildRequestMessagesAsync 内有惰性兜底以防万一。
+            // 现在确保 ResolveSolutionPathAsync 完成后再执行 LoadAndShowAsync。
             _ = Microsoft.VisualStudio.Shell.ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
                 await ResolveSolutionPathAsync();

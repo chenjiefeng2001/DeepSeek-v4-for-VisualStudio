@@ -600,8 +600,8 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         }
 
         /// <summary>
-        /// 构建动态上下文块：合并压缩摘要、搜索上下文、RAG 上下文、记忆上下文。
-        /// 所有动态内容合并为一段文本，作为单条 system 消息注入。
+        /// 构建动态上下文块：合并压缩摘要、记忆上下文和语言守卫。
+        /// 所有同轮次内相对稳定的内容合并为一段文本，作为单条 system 消息注入。
         /// 这样将可变内容隔离在一个位置，保护 messages[0] 和对话历史前缀的缓存稳定性。
         /// </summary>
         private string? BuildDynamicContextBlock()
@@ -615,10 +615,6 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 if (!string.IsNullOrWhiteSpace(compressedText))
                     parts.Add(compressedText);
             }
-
-            // 搜索上下文
-            if (!string.IsNullOrWhiteSpace(_searchContext))
-                parts.Add(_searchContext!);
 
             // 记忆上下文
             if (!string.IsNullOrWhiteSpace(_memoryContext))
@@ -730,7 +726,7 @@ namespace DeepSeek_v4_for_VisualStudio.Services
         }
 
         /// <summary>
-        /// 构建易变上下文块：Active Working Set + RAG 检索上下文。
+        /// 构建易变上下文块：Active Working Set + 联网搜索结果 + RAG 检索上下文。
         /// 这些内容在同一会话内可能每轮都变，应从消息数组末尾注入以保护前缀缓存。
         /// </summary>
         public string? BuildVolatileContextBlock()
@@ -747,6 +743,10 @@ namespace DeepSeek_v4_for_VisualStudio.Services
                 if (!string.IsNullOrWhiteSpace(activeFileSummary))
                     parts.Add(activeFileSummary);
             }
+
+            // ── 联网搜索结果（与 RAG 一起放在 user 前，避免干扰 [0..2] 稳定前缀）──
+            if (!string.IsNullOrWhiteSpace(_searchContext))
+                parts.Add(_searchContext!);
 
             // ── RAG 检索上下文 ──
             if (!string.IsNullOrWhiteSpace(_ragContext))
